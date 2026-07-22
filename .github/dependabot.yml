@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # Batch non-breaking updates into a single PR to reduce noise.
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep any GitHub Actions workflows current once they exist.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

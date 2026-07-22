@@ -1,0 +1,5 @@
+/target
+
+# Session files written by the examples (contain auth tokens — never commit)
+session.json
+*.session.json
