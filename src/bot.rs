@@ -370,10 +370,10 @@ impl BotBuilder {
         }
 
         // 4. Persist the (possibly refreshed) session. Best-effort.
-        if let Some(path) = &self.config.session_path {
-            if let Err(err) = agent.to_config().await.save(&FileStore::new(path)).await {
-                tracing::warn!(error = %err, "failed to persist session file");
-            }
+        if let Some(path) = &self.config.session_path
+            && let Err(err) = agent.to_config().await.save(&FileStore::new(path)).await
+        {
+            tracing::warn!(error = %err, "failed to persist session file");
         }
 
         // 5. Resolve the bot's own identity.
@@ -558,10 +558,11 @@ impl Bot {
             self.handlers.dispatch(self.context.clone(), notif).await;
         }
 
-        if count > 0 && self.config.mark_seen {
-            if let Err(err) = self.mark_seen().await {
-                tracing::warn!(error = %err, "failed to mark notifications seen");
-            }
+        if count > 0
+            && self.config.mark_seen
+            && let Err(err) = self.mark_seen().await
+        {
+            tracing::warn!(error = %err, "failed to mark notifications seen");
         }
 
         Ok(count)
