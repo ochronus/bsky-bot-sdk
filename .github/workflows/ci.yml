@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Weekly run surfaces ecosystem drift (a new stable release breaking the build,
+  # or a freshly published advisory) on a schedule instead of on an unrelated PR.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -16,11 +20,16 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fail the build on any warning. Cargo applies `--cap-lints allow` to
-  # dependencies, so this only denies warnings in this crate's own code.
-  RUSTFLAGS: "-D warnings"
+  # Pinned toolchain for the lint/format/doc gates below. Pinning keeps those
+  # jobs reproducible, so a new Rust release that adds clippy/rustdoc lints does
+  # NOT turn CI red on unrelated changes. Bump this deliberately to adopt newer
+  # lints, and match it locally with `rustup toolchain install <version>`.
+  LINT_TOOLCHAIN: "1.97.1"
 
 jobs:
+  # Build + test on floating `stable` (catches real breakage from new releases)
+  # and the crate's MSRV. These deliberately do NOT deny warnings: a new compiler
+  # lint should never break the build here — only genuine errors do.
   test:
     name: Test (${{ matrix.rust }})
     runs-on: ubuntu-latest
@@ -45,41 +54,50 @@ jobs:
       - name: Doc tests
         run: cargo test --all-features --doc
 
+  # The format/lint/doc gates run on the PINNED toolchain and DO deny warnings,
+  # so quality is enforced deterministically and only changes when LINT_TOOLCHAIN
+  # is bumped on purpose.
   fmt:
-    name: Rustfmt
+    name: Rustfmt (pinned)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.LINT_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
 
   clippy:
-    name: Clippy
+    name: Clippy (pinned)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.LINT_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Denies both clippy lints and rustc warnings (clippy drives the compiler),
+      # which is why the `test` jobs above don't need to.
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   docs:
-    name: Doc build
+    name: Doc build (pinned)
     runs-on: ubuntu-latest
     env:
       # Treat broken intra-doc links and other rustdoc lints as errors.
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.LINT_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
         run: cargo doc --no-deps --all-features
@@ -89,9 +107,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.LINT_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
+      # Fails on actual vulnerability advisories. Non-vulnerability warnings
+      # (unmaintained/yanked) are reported but do not fail the build, so a newly
+      # published informational advisory can't break CI on an unrelated push.
       - name: Audit dependencies for advisories
-        run: cargo audit --deny warnings
+        run: cargo audit
