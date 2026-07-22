@@ -10,7 +10,8 @@ An ergonomic, event-driven SDK for building **Bluesky** (AT Protocol) bots in Ru
 It's built on top of atrium's [`bsky-sdk`](https://crates.io/crates/bsky-sdk) and
 adds the glue a bot actually needs: a notification event loop, typed events,
 one-call reply/like/repost/follow helpers with automatic rich-text detection,
-session persistence, client-side rate limiting, and graceful shutdown.
+session persistence, client-side rate limiting, interval/cron scheduling, and
+graceful shutdown.
 
 ```rust
 use bsky_bot_sdk::prelude::*;
@@ -49,6 +50,7 @@ still needs the loop around it. This crate provides:
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
+| **Scheduling** | Run actions on an interval or a cron schedule (`every`, `cron`) — many at once, alongside the notification loop. |
 | **Shutdown** | `run()` stops cleanly on `Ctrl-C`; `run_until(future)` stops on any signal you choose. |
 
 ## Installation
@@ -135,10 +137,47 @@ Run any example with credentials in the environment:
 ```bash
 export BSKY_IDENTIFIER=you.bsky.social
 export BSKY_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-cargo run --example mention_bot   # like + reply to mentions
-cargo run --example follow_back   # follow back new followers
-cargo run --example reactor       # mentions, replies, follows, likes, error handling
+cargo run --example mention_bot       # like + reply to mentions
+cargo run --example follow_back       # follow back new followers
+cargo run --example reactor           # mentions, replies, follows, likes, error handling
+cargo run --example scheduled_poster  # post the date/time once a day (no handlers)
 ```
+
+## Scheduling
+
+Besides reacting to notifications, a bot can run **actions on a schedule** — an
+interval or a cron expression. Register as many as you like; they run
+concurrently with the notification loop and stop cleanly on shutdown. A bot may
+have *only* schedules and no notification handlers.
+
+```rust
+# use std::time::Duration;
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b
+    // Simple fixed interval:
+    .every(Duration::from_secs(3600), |ctx| async move {
+        ctx.post("hourly heartbeat").await?;
+        Ok(())
+    })
+    // Cron, evaluated in UTC. 5-field and 6-field (with seconds) both work,
+    // as do macros like @daily / @hourly:
+    .cron("0 12 * * *", |ctx| async move {   // 12:00 UTC every day
+        ctx.post("daily digest").await?;
+        Ok(())
+    })
+    // Cron in the host's local timezone instead of UTC:
+    .cron_local("*/15 9-17 * * MON-FRI", |ctx| async move {
+        ctx.post("every 15 min, 9–5 on weekdays, local time").await?;
+        Ok(())
+    })
+# }
+```
+
+You can also build a [`Schedule`] from a string and pass it to `schedule(...)`:
+`"@every 30m"` (simple interval syntax) or any cron expression / macro. An
+invalid cron expression is reported from `build()`, so the builder chain stays
+fluent. Scheduled-task errors are logged and never stop the loop.
 
 ## Rate limiting
 

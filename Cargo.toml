@@ -1,8 +1,8 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 description = "An ergonomic, event-driven SDK for building Bluesky (AT Protocol) bots in Rust, on top of atrium's bsky-sdk."
 repository = "https://github.com/ochronus/bsky-bot-sdk"
@@ -30,6 +30,13 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Scheduling: wall-clock time (already in the tree via atrium), cron-expression
+# parsing (5- and 6-field plus @daily-style macros), and simple human-interval
+# syntax ("30s", "5m", "1h30m").
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+croner = "3"
+humantime = "2"
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -45,3 +52,7 @@ path = "examples/follow_back.rs"
 [[example]]
 name = "reactor"
 path = "examples/reactor.rs"
+
+[[example]]
+name = "scheduled_poster"
+path = "examples/scheduled_poster.rs"

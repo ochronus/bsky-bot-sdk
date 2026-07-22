@@ -16,6 +16,8 @@
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
+//! - **Scheduling** — run actions on an interval or a cron schedule (see
+//!   [`Schedule`] and [`BotBuilder::every`]/[`BotBuilder::cron`]).
 //! - **Graceful shutdown** on `Ctrl-C` or any future you provide.
 //!
 //! ## Quick start
@@ -67,6 +69,7 @@ mod error;
 mod event;
 mod handler;
 mod ratelimit;
+mod schedule;
 
 pub mod prelude;
 
@@ -78,6 +81,7 @@ pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use schedule::{Schedule, Tz};
 
 // Re-export the underlying crates for advanced use and to guarantee a single,
 // consistent version of the AT Protocol types across your app.

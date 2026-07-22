@@ -6,5 +6,5 @@
 
 pub use crate::{
     Bot, BotBuilder, BotConfig, BotIdentity, Context, Dedup, Error, Notification,
-    NotificationReason, RateLimitConfig, Result,
+    NotificationReason, RateLimitConfig, Result, Schedule, Tz,
 };

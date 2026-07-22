@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
 use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
 use crate::ratelimit::{RateLimitConfig, WriteBudget};
+use crate::schedule::{Schedule, Scheduler, boxed_task};
 
 /// Generate the `on_<reason>` convenience builders. They all share the same
 /// handler bounds and simply forward to [`BotBuilder::on`], so expressing them
@@ -63,6 +65,11 @@ pub struct BotBuilder {
     password: Option<String>,
     config: BotConfig,
     handlers: Handlers,
+    scheduler: Scheduler,
+    /// The first error from a fallible scheduling call (e.g. a bad cron
+    /// expression), surfaced from [`build`](BotBuilder::build) so the builder
+    /// chain stays fluent.
+    schedule_error: Option<Error>,
 }
 
 impl BotBuilder {
@@ -212,11 +219,120 @@ impl BotBuilder {
         self
     }
 
+    // --- scheduling --------------------------------------------------------
+
+    /// Run `task` every `interval`, starting one `interval` after the bot starts.
+    ///
+    /// The task receives the shared [`Context`], so it can post, reply, or reach
+    /// the raw agent just like a notification handler. Register as many as you
+    /// like; they run concurrently with the notification loop.
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.every(Duration::from_secs(3600), |ctx| async move {
+    ///     ctx.post("hourly heartbeat").await?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn every<F, Fut>(mut self, interval: Duration, task: F) -> Self
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.scheduler
+            .push(Schedule::every(interval), boxed_task(task));
+        self
+    }
+
+    /// Run `task` on a cron schedule evaluated in **UTC**.
+    ///
+    /// Accepts 5-field (`min hour dom mon dow`) and 6-field
+    /// (`sec min hour dom mon dow`) expressions plus `@daily`-style macros. An
+    /// invalid expression is remembered and returned from
+    /// [`build`](BotBuilder::build), keeping the builder chain fluent.
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.cron("0 12 * * *", |ctx| async move {  // 12:00 UTC every day
+    ///     ctx.post("daily digest").await?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn cron<F, Fut>(mut self, expr: &str, task: F) -> Self
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        match Schedule::cron(expr) {
+            Ok(schedule) => self.scheduler.push(schedule, boxed_task(task)),
+            Err(err) => self.record_schedule_error(err),
+        }
+        self
+    }
+
+    /// Like [`cron`](Self::cron), but the expression is evaluated in the host's
+    /// local timezone instead of UTC.
+    pub fn cron_local<F, Fut>(mut self, expr: &str, task: F) -> Self
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        match Schedule::cron_local(expr) {
+            Ok(schedule) => self.scheduler.push(schedule, boxed_task(task)),
+            Err(err) => self.record_schedule_error(err),
+        }
+        self
+    }
+
+    /// Run `task` on a pre-built [`Schedule`] (for a custom [`Tz`](crate::Tz) or a
+    /// schedule parsed from a string).
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::{Bot, Schedule};
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::Result<bsky_bot_sdk::BotBuilder> {
+    /// let schedule: Schedule = "@every 15m".parse()?;
+    /// Ok(b.schedule(schedule, |ctx| async move {
+    ///     ctx.post("every 15 minutes").await?;
+    ///     Ok(())
+    /// }))
+    /// # }
+    /// ```
+    pub fn schedule<F, Fut>(mut self, schedule: Schedule, task: F) -> Self
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.scheduler.push(schedule, boxed_task(task));
+        self
+    }
+
+    /// Remember the first scheduling error so it can be surfaced from `build`.
+    fn record_schedule_error(&mut self, err: Error) {
+        if self.schedule_error.is_none() {
+            self.schedule_error = Some(err);
+        }
+    }
+
     // --- build -------------------------------------------------------------
 
     /// Authenticate (resuming a saved session if possible, otherwise logging in)
     /// and produce a runnable [`Bot`].
+    ///
+    /// # Errors
+    /// Returns any error deferred from a scheduling call (e.g. an invalid cron
+    /// expression passed to [`cron`](BotBuilder::cron)) before attempting to
+    /// authenticate.
     pub async fn build(self) -> Result<Bot> {
+        // 0. Surface any deferred scheduling error before doing network work.
+        if let Some(err) = self.schedule_error {
+            return Err(err);
+        }
+
         // 1. Load a persisted session/config if one exists.
         let persisted = match &self.config.session_path {
             Some(path) if path.exists() => Config::load(&FileStore::new(path)).await.ok(),
@@ -275,16 +391,18 @@ impl BotBuilder {
             context,
             config: self.config,
             handlers: self.handlers,
+            scheduler: self.scheduler,
         })
     }
 }
 
 /// A configured, authenticated bot ready to poll for notifications and dispatch
-/// them to handlers.
+/// them to handlers, plus any scheduled jobs.
 pub struct Bot {
     context: Context,
     config: BotConfig,
     handlers: Handlers,
+    scheduler: Scheduler,
 }
 
 impl Bot {
@@ -323,15 +441,64 @@ impl Bot {
 
     /// Run until the provided `shutdown` future resolves.
     ///
-    /// Returns [`Error::NoHandlers`] immediately if no handlers were registered.
+    /// Drives the notification loop (when any handlers are registered) and every
+    /// scheduled job (see [`every`](BotBuilder::every) / [`cron`](BotBuilder::cron))
+    /// concurrently, stopping all of them cleanly on shutdown.
+    ///
+    /// Returns [`Error::NoHandlers`] immediately if neither a handler nor a
+    /// scheduled job was registered — the bot would have nothing to do.
     pub async fn run_until<F>(self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
     {
-        if self.handlers.is_empty() {
+        if self.handlers.is_empty() && self.scheduler.is_empty() {
             return Err(Error::NoHandlers);
         }
 
+        // Spawn each scheduled job on its own task. They are cancelled
+        // cooperatively via a watch channel, so an in-flight task runs to
+        // completion before its job stops.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let job_handles: Vec<_> = self
+            .scheduler
+            .jobs()
+            .iter()
+            .map(|job| tokio::spawn(job.clone().run(self.context.clone(), shutdown_rx.clone())))
+            .collect();
+        if !self.scheduler.is_empty() {
+            tracing::info!(jobs = self.scheduler.len(), "scheduler started");
+        }
+
+        tokio::pin!(shutdown);
+
+        if self.handlers.is_empty() {
+            // Scheduled work only: no polling to do, so just wait for shutdown.
+            tracing::info!(
+                handle = %self.context.handle(),
+                did = %self.context.did(),
+                "bot started (scheduled jobs only)",
+            );
+            shutdown.await;
+            tracing::info!("shutdown signal received; stopping");
+        } else {
+            self.run_notification_loop(shutdown).await;
+        }
+
+        // Tell scheduled jobs to stop and wait for them to wind down.
+        let _ = shutdown_tx.send(true);
+        for handle in job_handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+
+    /// The notification polling loop: prime the watermark, then poll and dispatch
+    /// on each tick until `shutdown` resolves.
+    async fn run_notification_loop<F>(&self, mut shutdown: Pin<&mut F>)
+    where
+        F: Future<Output = ()>,
+    {
         let mut dedup = Dedup::new();
 
         // Unless asked to drain it, skip whatever backlog exists at startup.
@@ -350,7 +517,6 @@ impl Bot {
             }
         }
 
-        tokio::pin!(shutdown);
         let mut ticker = tokio::time::interval(self.config.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -376,8 +542,6 @@ impl Bot {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Perform one poll cycle against the given [`Dedup`]: fetch notifications,
@@ -503,5 +667,76 @@ mod tests {
         }
         let result = Bot::builder().from_env();
         assert!(matches!(result, Err(Error::MissingCredentials)));
+    }
+
+    #[tokio::test]
+    async fn build_defers_invalid_cron_error_until_build() {
+        // The fluent `.cron(...)` call cannot return a Result, so a bad
+        // expression must surface from `build()`.
+        let result = Bot::builder()
+            .cron("total nonsense", |_ctx| async move { Ok(()) })
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidInput(_))),
+            "an invalid cron expression should fail the build with InvalidInput",
+        );
+    }
+
+    /// Build a `Bot` without any network I/O (an agent with no session performs
+    /// none), for exercising the run loop's start-up guards.
+    async fn offline_bot(with_schedule: bool, with_handler: bool) -> Bot {
+        let agent = bsky_sdk::BskyAgent::builder()
+            .build()
+            .await
+            .expect("build agent");
+        let identity = Arc::new(BotIdentity::new(
+            "did:plc:bot00000000000000000000000"
+                .parse()
+                .expect("valid did"),
+            "bot.test".parse().expect("valid handle"),
+        ));
+        let context = Context::new(agent, identity, WriteBudget::new(None));
+
+        let mut handlers = Handlers::default();
+        if with_handler {
+            handlers.register_any(boxed_handler(|_c, _n| async move { Ok(()) }));
+        }
+        let mut scheduler = Scheduler::default();
+        if with_schedule {
+            scheduler.push(
+                Schedule::every(Duration::from_secs(3600)),
+                boxed_task(|_ctx| async move { Ok(()) }),
+            );
+        }
+
+        Bot {
+            context,
+            config: BotConfig::default(),
+            handlers,
+            scheduler,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_until_errors_when_there_is_nothing_to_do() {
+        let bot = offline_bot(false, false).await;
+        let result = bot.run_until(async {}).await;
+        assert!(
+            matches!(result, Err(Error::NoHandlers)),
+            "a bot with no handlers and no schedules should refuse to run",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_with_only_a_schedule_runs_and_stops_cleanly() {
+        let bot = offline_bot(true, false).await;
+        // Immediate shutdown. With no handlers there is no polling (no network);
+        // the scheduled job is spawned and then cancelled cooperatively.
+        let result = bot.run_until(async {}).await;
+        assert!(
+            result.is_ok(),
+            "a schedule-only bot must run without erroring as NoHandlers: {result:?}",
+        );
     }
 }
