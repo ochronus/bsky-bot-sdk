@@ -27,9 +27,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `stable` plus the crate's MSRV. Transitive deps (icu, via idna →
-        # reqwest/url) require rustc 1.86, so that is the effective floor.
-        rust: [stable, "1.86"]
+        # `stable` plus the crate's MSRV. The floor is set by the transitive
+        # `base45` crate (via atrium's cid/multibase), which uses `as_chunks`,
+        # stabilised in Rust 1.88.
+        rust: [stable, "1.88"]
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust (${{ matrix.rust }})

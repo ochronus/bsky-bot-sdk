@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run_until` now drives scheduled jobs alongside the notification loop and only
   returns `Error::NoHandlers` when neither a handler nor a schedule is
   registered.
-- Minimum supported Rust version raised to **1.86**, required by transitive
-  `icu`/`idna` crates pulled in through `reqwest`/`url`.
+- Minimum supported Rust version raised to **1.88**, required by transitive
+  dependencies pulled in through `atrium`/`reqwest` (notably `base45`, which uses
+  `<[T]>::as_chunks`, stabilised in Rust 1.88).
 
 [`croner`]: https://crates.io/crates/croner
 

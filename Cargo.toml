@@ -2,7 +2,10 @@
 name = "bsky-bot-sdk"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.86"
+# 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
+# ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
+# despite under-declaring its own MSRV.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "An ergonomic, event-driven SDK for building Bluesky (AT Protocol) bots in Rust, on top of atrium's bsky-sdk."
 repository = "https://github.com/ochronus/bsky-bot-sdk"
