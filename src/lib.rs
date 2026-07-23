@@ -7,6 +7,11 @@
 //!
 //! - **A notification event loop** that polls `listNotifications`, de-duplicates
 //!   across restarts, and dispatches each event to your handlers.
+//! - **Real-time network ingestion** via the
+//!   [Jetstream](https://docs.bsky.app/blog/jetstream) firehose — react to the
+//!   *whole network* with [`on_keyword`](BotBuilder::on_keyword),
+//!   [`on_hashtag`](BotBuilder::on_hashtag), or
+//!   [`on_firehose`](BotBuilder::on_firehose), not just your own notifications.
 //! - **Typed events** — match on [`NotificationReason::Mention`],
 //!   [`NotificationReason::Follow`], … instead of stringly-typed reasons.
 //! - **Action helpers** on [`Context`] — [`reply_to`](Context::reply_to),
@@ -70,6 +75,7 @@ mod event;
 mod handler;
 mod ratelimit;
 mod schedule;
+mod stream;
 
 pub mod prelude;
 
@@ -82,6 +88,10 @@ pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use schedule::{Schedule, Tz};
+pub use stream::{
+    Backoff, CommitOp, DEFAULT_JETSTREAM_ENDPOINT, JetstreamConfig, RawCommit, RawStreamEvent,
+    StreamEvent, StreamKind,
+};
 
 // Re-export the underlying crates for advanced use and to guarantee a single,
 // consistent version of the AT Protocol types across your app.

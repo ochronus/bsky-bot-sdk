@@ -3,3 +3,13 @@
 # Session files written by the examples (contain auth tokens — never commit)
 session.json
 *.session.json
+
+# Local credentials (never commit)
+.env
+.env.*
+
+# Editor / tooling caches
+/.serena/
+
+# Local-only planning notes
+/ROADMAP.md

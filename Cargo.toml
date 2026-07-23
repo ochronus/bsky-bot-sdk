@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
@@ -40,6 +40,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 croner = "3"
 humantime = "2"
 
+# Real-time ingestion (Jetstream): a WebSocket client using native-tls, which
+# matches the TLS backend reqwest already pulls in — no second TLS stack. Only
+# the uncompressed JSON stream is consumed, so `zstd` is deliberately not a
+# dependency. `futures-util` provides the Stream/Sink extension traits.
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+    "sink",
+] }
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -59,3 +69,7 @@ path = "examples/reactor.rs"
 [[example]]
 name = "scheduled_poster"
 path = "examples/scheduled_poster.rs"
+
+[[example]]
+name = "keyword_stream"
+path = "examples/keyword_stream.rs"

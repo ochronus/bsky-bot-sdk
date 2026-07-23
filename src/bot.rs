@@ -20,6 +20,10 @@ use crate::event::{Notification, NotificationReason};
 use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
 use crate::ratelimit::{RateLimitConfig, WriteBudget};
 use crate::schedule::{Schedule, Scheduler, boxed_task};
+use crate::stream::{
+    JetstreamConfig, Matcher, StreamEvent, StreamHandlers, StreamRunner,
+    boxed_stream_error_handler, boxed_stream_handler,
+};
 
 /// Generate the `on_<reason>` convenience builders. They all share the same
 /// handler bounds and simply forward to [`BotBuilder::on`], so expressing them
@@ -66,6 +70,8 @@ pub struct BotBuilder {
     config: BotConfig,
     handlers: Handlers,
     scheduler: Scheduler,
+    stream_config: JetstreamConfig,
+    stream_handlers: StreamHandlers,
     /// The first error from a fallible scheduling call (e.g. a bad cron
     /// expression), surfaced from [`build`](BotBuilder::build) so the builder
     /// chain stays fluent.
@@ -318,6 +324,145 @@ impl BotBuilder {
         }
     }
 
+    // --- real-time stream (Jetstream) --------------------------------------
+
+    /// React to *every* event on the network via the [Jetstream] firehose.
+    ///
+    /// The handler receives a [`StreamEvent`] for each commit (and identity /
+    /// account event) in the collections the stream is subscribed to. With no
+    /// [`jetstream_collections`](Self::jetstream_collections) filter this is the
+    /// entire network — very high volume — so most bots should scope it.
+    ///
+    /// Runs concurrently with the notification loop and any schedules; a bot may
+    /// run with *only* stream handlers.
+    ///
+    /// [Jetstream]: https://docs.bsky.app/blog/jetstream
+    pub fn on_firehose<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, StreamEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.stream_handlers
+            .push(Matcher::Firehose, boxed_stream_handler(handler));
+        self
+    }
+
+    /// React to network posts whose text contains `keyword` (case-insensitive).
+    ///
+    /// Implicitly subscribes the stream to `app.bsky.feed.post`.
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.on_keyword("rustlang", |ctx, event| async move {
+    ///     if let Some(subject) = event.strong_ref() {
+    ///         ctx.like_ref(subject).await?;
+    ///     }
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn on_keyword<F, Fut>(self, keyword: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Context, StreamEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.on_keywords([keyword.into()], handler)
+    }
+
+    /// React to network posts whose text contains *any* of `keywords`
+    /// (case-insensitive). Implicitly subscribes to `app.bsky.feed.post`.
+    pub fn on_keywords<F, Fut, I, S>(mut self, keywords: I, handler: F) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        F: Fn(Context, StreamEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let keywords: Vec<String> = keywords
+            .into_iter()
+            .map(|k| k.into().to_lowercase())
+            .collect();
+        self.stream_handlers
+            .push(Matcher::Keyword(keywords), boxed_stream_handler(handler));
+        self
+    }
+
+    /// React to network posts carrying the hashtag `tag` (with or without a
+    /// leading `#`, case-insensitive). Matches both `#tag` tokens in the post
+    /// text and structured record tags. Implicitly subscribes to
+    /// `app.bsky.feed.post`.
+    pub fn on_hashtag<F, Fut>(mut self, tag: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Context, StreamEvent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let tag = tag.into();
+        let tag = tag.strip_prefix('#').unwrap_or(&tag).to_lowercase();
+        self.stream_handlers
+            .push(Matcher::Hashtag(vec![tag]), boxed_stream_handler(handler));
+        self
+    }
+
+    /// Register an error handler for stream handlers, mirroring
+    /// [`on_error`](Self::on_error). Without one, stream handler errors are
+    /// logged via `tracing`.
+    pub fn on_stream_error<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, StreamEvent, Error) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.stream_handlers
+            .set_error(boxed_stream_error_handler(handler));
+        self
+    }
+
+    /// Override the Jetstream endpoint (default
+    /// [`DEFAULT_JETSTREAM_ENDPOINT`](crate::DEFAULT_JETSTREAM_ENDPOINT)).
+    pub fn jetstream_endpoint(mut self, url: impl Into<String>) -> Self {
+        self.stream_config.endpoint = url.into();
+        self
+    }
+
+    /// Add explicit collection NSIDs to the Jetstream subscription (e.g.
+    /// `app.bsky.graph.follow`, or a prefix like `app.bsky.*`). Combined with
+    /// whatever keyword/hashtag handlers imply.
+    pub fn jetstream_collections<I, S>(mut self, collections: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.stream_config
+            .collections
+            .extend(collections.into_iter().map(Into::into));
+        self
+    }
+
+    /// Restrict the Jetstream subscription to specific repository DIDs.
+    pub fn jetstream_dids<I, S>(mut self, dids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.stream_config
+            .dids
+            .extend(dids.into_iter().map(Into::into));
+        self
+    }
+
+    /// Start the Jetstream stream from an explicit cursor (unix microseconds)
+    /// instead of the live tail — for replaying missed events after downtime.
+    pub fn jetstream_cursor(mut self, time_us: u64) -> Self {
+        self.stream_config.cursor = Some(time_us);
+        self
+    }
+
+    /// Replace the entire [`JetstreamConfig`] at once.
+    pub fn jetstream_config(mut self, config: JetstreamConfig) -> Self {
+        self.stream_config = config;
+        self
+    }
+
     // --- build -------------------------------------------------------------
 
     /// Authenticate (resuming a saved session if possible, otherwise logging in)
@@ -392,6 +537,8 @@ impl BotBuilder {
             config: self.config,
             handlers: self.handlers,
             scheduler: self.scheduler,
+            stream_config: self.stream_config,
+            stream_handlers: self.stream_handlers,
         })
     }
 }
@@ -403,6 +550,8 @@ pub struct Bot {
     config: BotConfig,
     handlers: Handlers,
     scheduler: Scheduler,
+    stream_config: JetstreamConfig,
+    stream_handlers: StreamHandlers,
 }
 
 impl Bot {
@@ -441,25 +590,31 @@ impl Bot {
 
     /// Run until the provided `shutdown` future resolves.
     ///
-    /// Drives the notification loop (when any handlers are registered) and every
-    /// scheduled job (see [`every`](BotBuilder::every) / [`cron`](BotBuilder::cron))
-    /// concurrently, stopping all of them cleanly on shutdown.
+    /// Drives the notification loop (when any handlers are registered), the
+    /// [Jetstream] real-time stream (when any stream handlers are registered),
+    /// and every scheduled job (see [`every`](BotBuilder::every) /
+    /// [`cron`](BotBuilder::cron)) concurrently, stopping all of them cleanly on
+    /// shutdown.
     ///
-    /// Returns [`Error::NoHandlers`] immediately if neither a handler nor a
-    /// scheduled job was registered — the bot would have nothing to do.
+    /// Returns [`Error::NoHandlers`] immediately if no notification handler, no
+    /// stream handler, and no scheduled job were registered — the bot would have
+    /// nothing to do.
+    ///
+    /// [Jetstream]: https://docs.bsky.app/blog/jetstream
     pub async fn run_until<F>(self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()>,
     {
-        if self.handlers.is_empty() && self.scheduler.is_empty() {
+        let has_stream = !self.stream_handlers.is_empty();
+        if self.handlers.is_empty() && self.scheduler.is_empty() && !has_stream {
             return Err(Error::NoHandlers);
         }
 
-        // Spawn each scheduled job on its own task. They are cancelled
-        // cooperatively via a watch channel, so an in-flight task runs to
-        // completion before its job stops.
+        // Spawn each scheduled job and the stream runner on their own tasks. All
+        // are cancelled cooperatively via a shared watch channel, so in-flight
+        // work runs to completion before it stops.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let job_handles: Vec<_> = self
+        let mut background: Vec<tokio::task::JoinHandle<()>> = self
             .scheduler
             .jobs()
             .iter()
@@ -468,15 +623,24 @@ impl Bot {
         if !self.scheduler.is_empty() {
             tracing::info!(jobs = self.scheduler.len(), "scheduler started");
         }
+        if has_stream {
+            let runner =
+                StreamRunner::new(self.stream_config.clone(), self.stream_handlers.clone());
+            background.push(tokio::spawn(
+                runner.run(self.context.clone(), shutdown_rx.clone()),
+            ));
+            tracing::info!("jetstream ingestion started");
+        }
 
         tokio::pin!(shutdown);
 
         if self.handlers.is_empty() {
-            // Scheduled work only: no polling to do, so just wait for shutdown.
+            // No notification handlers: nothing to poll, so just wait for
+            // shutdown while the background tasks (stream / schedules) run.
             tracing::info!(
                 handle = %self.context.handle(),
                 did = %self.context.did(),
-                "bot started (scheduled jobs only)",
+                "bot started (background tasks only)",
             );
             shutdown.await;
             tracing::info!("shutdown signal received; stopping");
@@ -484,9 +648,9 @@ impl Bot {
             self.run_notification_loop(shutdown).await;
         }
 
-        // Tell scheduled jobs to stop and wait for them to wind down.
+        // Tell background tasks to stop and wait for them to wind down.
         let _ = shutdown_tx.send(true);
-        for handle in job_handles {
+        for handle in background {
             let _ = handle.await;
         }
 
@@ -686,7 +850,7 @@ mod tests {
 
     /// Build a `Bot` without any network I/O (an agent with no session performs
     /// none), for exercising the run loop's start-up guards.
-    async fn offline_bot(with_schedule: bool, with_handler: bool) -> Bot {
+    async fn offline_bot(with_schedule: bool, with_handler: bool, with_stream: bool) -> Bot {
         let agent = bsky_sdk::BskyAgent::builder()
             .build()
             .await
@@ -710,34 +874,57 @@ mod tests {
                 boxed_task(|_ctx| async move { Ok(()) }),
             );
         }
+        let mut stream_handlers = StreamHandlers::default();
+        if with_stream {
+            stream_handlers.push(
+                Matcher::Firehose,
+                boxed_stream_handler(|_c, _e| async move { Ok(()) }),
+            );
+        }
 
         Bot {
             context,
             config: BotConfig::default(),
             handlers,
             scheduler,
+            stream_config: JetstreamConfig::default(),
+            stream_handlers,
         }
     }
 
     #[tokio::test]
     async fn run_until_errors_when_there_is_nothing_to_do() {
-        let bot = offline_bot(false, false).await;
+        let bot = offline_bot(false, false, false).await;
         let result = bot.run_until(async {}).await;
         assert!(
             matches!(result, Err(Error::NoHandlers)),
-            "a bot with no handlers and no schedules should refuse to run",
+            "a bot with no handlers, schedules, or stream should refuse to run",
         );
     }
 
     #[tokio::test]
     async fn run_until_with_only_a_schedule_runs_and_stops_cleanly() {
-        let bot = offline_bot(true, false).await;
+        let bot = offline_bot(true, false, false).await;
         // Immediate shutdown. With no handlers there is no polling (no network);
         // the scheduled job is spawned and then cancelled cooperatively.
         let result = bot.run_until(async {}).await;
         assert!(
             result.is_ok(),
             "a schedule-only bot must run without erroring as NoHandlers: {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_with_only_a_stream_runs_and_stops_cleanly() {
+        let bot = offline_bot(false, false, true).await;
+        // Immediate shutdown on the current-thread test runtime: the spawned
+        // stream runner is only polled once the main task awaits the join, by
+        // which point the shutdown flag is already set — so it exits at the top
+        // of its loop before attempting any network connection.
+        let result = bot.run_until(async {}).await;
+        assert!(
+            result.is_ok(),
+            "a stream-only bot must run without erroring as NoHandlers: {result:?}",
         );
     }
 }

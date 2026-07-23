@@ -5,6 +5,7 @@
 //! ```
 
 pub use crate::{
-    Bot, BotBuilder, BotConfig, BotIdentity, Context, Dedup, Error, Notification,
-    NotificationReason, RateLimitConfig, Result, Schedule, Tz,
+    Bot, BotBuilder, BotConfig, BotIdentity, CommitOp, Context, Dedup, Error, JetstreamConfig,
+    Notification, NotificationReason, RateLimitConfig, Result, Schedule, StreamEvent, StreamKind,
+    Tz,
 };

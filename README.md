@@ -8,10 +8,11 @@
 An ergonomic, event-driven SDK for building **Bluesky** (AT Protocol) bots in Rust.
 
 It's built on top of atrium's [`bsky-sdk`](https://crates.io/crates/bsky-sdk) and
-adds the glue a bot actually needs: a notification event loop, typed events,
-one-call reply/like/repost/follow helpers with automatic rich-text detection,
-session persistence, client-side rate limiting, interval/cron scheduling, and
-graceful shutdown.
+adds the glue a bot actually needs: a notification event loop, real-time network
+ingestion via the [Jetstream](https://docs.bsky.app/blog/jetstream) firehose,
+typed events, one-call reply/like/repost/follow helpers with automatic rich-text
+detection, session persistence, client-side rate limiting, interval/cron
+scheduling, and graceful shutdown.
 
 ```rust
 use bsky_bot_sdk::prelude::*;
@@ -44,6 +45,7 @@ still needs the loop around it. This crate provides:
 | Concern | What you get |
 | --- | --- |
 | **Event loop** | Polls `listNotifications` on an interval, dispatches to your handlers. |
+| **Real-time stream** | React to the *whole network* via the [Jetstream](https://docs.bsky.app/blog/jetstream) firehose — `on_keyword`, `on_hashtag`, `on_firehose` — with auto-reconnect and cursor resume. |
 | **De-duplication** | A watermark tracker (`Dedup`) that survives restarts and breaks timestamp ties, so you never double-reply. |
 | **Typed events** | `NotificationReason::{Mention, Reply, Follow, Like, Repost, Quote, …}` instead of magic strings. |
 | **Actions** | `ctx.reply_to`, `ctx.like`, `ctx.repost`, `ctx.follow_back`, `ctx.post`, `ctx.delete` — threading and facet detection handled for you. |
@@ -57,7 +59,7 @@ still needs the loop around it. This crate provides:
 
 ```toml
 [dependencies]
-bsky-bot-sdk = "0.1"
+bsky-bot-sdk = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -141,7 +143,51 @@ cargo run --example mention_bot       # like + reply to mentions
 cargo run --example follow_back       # follow back new followers
 cargo run --example reactor           # mentions, replies, follows, likes, error handling
 cargo run --example scheduled_poster  # post the date/time once a day (no handlers)
+cargo run --example keyword_stream    # react to network-wide keywords/hashtags (Jetstream)
 ```
+
+## Real-time streaming (Jetstream)
+
+Notifications only tell you about *your own* account. To react to the **whole
+network** in real time, connect a bot to a public
+[Jetstream](https://docs.bsky.app/blog/jetstream) instance — a lightweight JSON
+view of the AT Protocol firehose. Stream handlers dispatch just like notification
+handlers, and a bot can mix both (or run with *only* a stream).
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b
+    // Any network post whose text contains a keyword (case-insensitive):
+    .on_keyword("rustlang", |ctx, event| async move {
+        // A StreamEvent gives you a strong ref you can act on directly.
+        if let Some(subject) = event.strong_ref() {
+            ctx.like_ref(subject).await?;
+        }
+        Ok(())
+    })
+    // Any post carrying a hashtag (matched from text and structured tags):
+    .on_hashtag("bluesky", |_ctx, event| async move {
+        if let Some(text) = event.text() {
+            println!("#bluesky: {text}");
+        }
+        Ok(())
+    })
+    // Or the raw firehose for a set of collections you configure:
+    .jetstream_collections(["app.bsky.graph.follow"])
+    .on_firehose(|_ctx, event| async move {
+        println!("{} {:?} {:?}", event.did(), event.operation(), event.collection());
+        Ok(())
+    })
+# }
+```
+
+Keyword and hashtag handlers subscribe to `app.bsky.feed.post` automatically. The
+connection reconnects on its own with exponential backoff and jitter, and tracks
+a time-based cursor so a reconnect resumes without gaps. Tune the endpoint,
+collection/DID filters, and starting cursor with `jetstream_endpoint`,
+`jetstream_collections`, `jetstream_dids`, and `jetstream_cursor` (or replace the
+whole `JetstreamConfig`). Compression (`zstd`) is not yet supported.
 
 ## Scheduling
 

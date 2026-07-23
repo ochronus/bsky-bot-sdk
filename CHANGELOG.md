@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-23
+
+### Added
+
+- **Real-time ingestion via Jetstream.** React to the *whole network* in real
+  time, not just the bot's own notifications, over a WebSocket connection to a
+  public [Jetstream] instance:
+  - `BotBuilder::on_keyword(keyword, handler)` / `on_keywords([...], handler)` —
+    fire on network posts whose text contains a keyword (case-insensitive).
+  - `BotBuilder::on_hashtag(tag, handler)` — fire on posts carrying a hashtag
+    (matched from both `#tag` text tokens and structured record tags).
+  - `BotBuilder::on_firehose(handler)` — fire on every event in the subscribed
+    collections.
+  - `BotBuilder::on_stream_error(handler)` — error handler for stream handlers.
+  - Configuration: `jetstream_endpoint`, `jetstream_collections`,
+    `jetstream_dids`, `jetstream_cursor`, and `jetstream_config`, plus the public
+    `JetstreamConfig` and `Backoff` types and `DEFAULT_JETSTREAM_ENDPOINT`.
+  - New `StreamEvent` type with typed accessors (`kind`, `operation`,
+    `collection`, `uri`, `as_post`, `text`, `strong_ref`, `hashtags`, …) and the
+    `StreamKind` / `CommitOp` enums. `strong_ref()` lets handlers like, repost,
+    or reply to a streamed post directly.
+  - The stream runs concurrently with the notification loop and schedules, with
+    automatic reconnect (exponential backoff + jitter) and time-based cursor
+    tracking for gapless resume. A bot may run with *only* stream handlers.
+  - Example: `keyword_stream` (watch the network for keywords/hashtags).
+  - Keyword and hashtag handlers subscribe to `app.bsky.feed.post` automatically;
+    a firehose handler with no collection filter subscribes to the whole network
+    (logged as a warning).
+
+### Changed
+
+- `run_until` now also drives the Jetstream stream, and only returns
+  `Error::NoHandlers` when no notification handler, stream handler, *or* schedule
+  is registered.
+
+### Notes
+
+- Jetstream `zstd` compression is not yet supported; the uncompressed JSON
+  stream is consumed. The WebSocket client uses `native-tls`, matching the TLS
+  backend already pulled in by `reqwest` — no second TLS stack is added.
+
+[Jetstream]: https://docs.bsky.app/blog/jetstream
+
 ## [0.2.0] - 2026-07-22
 
 ### Added
