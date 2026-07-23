@@ -7,16 +7,17 @@ use atrium_api::agent::AtprotoServiceType;
 use atrium_api::agent::bluesky::BSKY_CHAT_DID;
 use atrium_api::app::bsky::feed::{like, post, repost};
 use atrium_api::app::bsky::graph::follow;
+use atrium_api::chat::bsky::actor::declaration;
 use atrium_api::chat::bsky::convo::defs::{MessageInput, MessageInputData};
 use atrium_api::chat::bsky::convo::{get_convo_for_members, get_log, send_message};
 use atrium_api::com::atproto::repo::{create_record, delete_record, strong_ref};
 use atrium_api::types::BlobRef;
-use atrium_api::types::string::{Datetime, Did, Handle};
+use atrium_api::types::string::{Datetime, Did, Handle, RecordKey};
 use bsky_sdk::BskyAgent;
 use bsky_sdk::record::Record;
 use bsky_sdk::rich_text::RichText;
 
-use crate::dm::DirectMessage;
+use crate::dm::{DirectMessage, DmAccess};
 use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
@@ -397,6 +398,35 @@ impl Context {
             text: rich.text,
         }
         .into())
+    }
+
+    /// Set who may open a direct-message conversation with the bot, by publishing
+    /// the bot's `chat.bsky.actor.declaration` record.
+    ///
+    /// The account default blocks people the bot does not follow, so a bot that
+    /// should receive DMs from anyone must call this once (or use
+    /// [`accept_dms_from`](crate::BotBuilder::accept_dms_from) on the builder, which
+    /// applies it on startup). Writing the record is idempotent.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.set_dm_access(DmAccess::Everyone).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_dm_access(&self, access: DmAccess) -> Result<()> {
+        // The declaration is a singleton record keyed by the literal rkey "self".
+        let rkey: RecordKey = "self"
+            .parse()
+            .map_err(|_| Error::invalid_input("invalid record key for chat declaration"))?;
+        self.budget.charge_create().await;
+        declaration::RecordData {
+            allow_incoming: access.as_wire().to_string(),
+        }
+        .put(&self.agent, rkey)
+        .await?;
+        Ok(())
     }
 
     /// Fetch one page of the conversation-event log from `cursor`, used by the

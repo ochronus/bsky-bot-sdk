@@ -5,7 +5,7 @@
 //! ```
 
 pub use crate::{
-    Bot, BotBuilder, BotConfig, BotIdentity, CommitOp, Context, Dedup, DirectMessage, DmConfig,
-    Error, JetstreamConfig, MAX_POST_GRAPHEMES, Notification, NotificationReason, PostBuilder,
-    RateLimitConfig, Result, Schedule, StreamEvent, StreamKind, ThreadBuilder, Tz,
+    Bot, BotBuilder, BotConfig, BotIdentity, CommitOp, Context, Dedup, DirectMessage, DmAccess,
+    DmConfig, Error, JetstreamConfig, MAX_POST_GRAPHEMES, Notification, NotificationReason,
+    PostBuilder, RateLimitConfig, Result, Schedule, StreamEvent, StreamKind, ThreadBuilder, Tz,
 };

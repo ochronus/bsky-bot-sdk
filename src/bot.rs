@@ -16,7 +16,8 @@ use crate::config::BotConfig;
 use crate::context::{BotIdentity, Context};
 use crate::dedup::Dedup;
 use crate::dm::{
-    DirectMessage, DmConfig, DmHandlers, DmRunner, boxed_dm_error_handler, boxed_dm_handler,
+    DirectMessage, DmAccess, DmConfig, DmHandlers, DmRunner, boxed_dm_error_handler,
+    boxed_dm_handler,
 };
 use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
@@ -77,6 +78,8 @@ pub struct BotBuilder {
     stream_handlers: StreamHandlers,
     dm_config: DmConfig,
     dm_handlers: DmHandlers,
+    /// If set, publish the bot's chat inbox policy on startup.
+    dm_access: Option<DmAccess>,
     /// The first error from a fallible scheduling call (e.g. a bad cron
     /// expression), surfaced from [`build`](BotBuilder::build) so the builder
     /// chain stays fluent.
@@ -537,6 +540,29 @@ impl BotBuilder {
         self
     }
 
+    /// Publish the bot's direct-message inbox policy on startup, controlling who
+    /// may open a conversation with it.
+    ///
+    /// The account default blocks accounts the bot does not follow, so a bot that
+    /// should receive DMs from anyone needs [`DmAccess::Everyone`]. The record is
+    /// written once during [`build`](BotBuilder::build) (idempotent); for a runtime
+    /// change use [`Context::set_dm_access`](crate::Context::set_dm_access).
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.accept_dms_from(DmAccess::Everyone)
+    ///     .on_message(|ctx, dm| async move {
+    ///         ctx.send_dm_to_convo(dm.convo_id(), "hi!").await?;
+    ///         Ok(())
+    ///     })
+    /// # }
+    /// ```
+    pub fn accept_dms_from(mut self, access: DmAccess) -> Self {
+        self.dm_access = Some(access);
+        self
+    }
+
     // --- build -------------------------------------------------------------
 
     /// Authenticate (resuming a saved session if possible, otherwise logging in)
@@ -606,6 +632,15 @@ impl BotBuilder {
         let budget = WriteBudget::new(self.config.rate_limit.as_ref());
 
         let context = Context::new(agent, identity, budget);
+
+        // 7. Publish the chat inbox policy, if one was requested. Done here so a
+        //    bot that wants to accept DMs from anyone is configured before it
+        //    starts polling for them.
+        if let Some(access) = self.dm_access {
+            context.set_dm_access(access).await?;
+            tracing::info!(policy = access.as_wire(), "published chat inbox policy");
+        }
+
         Ok(Bot {
             context,
             config: self.config,
@@ -1050,5 +1085,17 @@ mod tests {
         );
         assert_eq!(builder.dm_config.poll_interval, Duration::from_secs(9));
         assert!(builder.dm_config.process_backlog);
+    }
+
+    #[test]
+    fn accept_dms_from_records_the_inbox_policy() {
+        let none = Bot::builder();
+        assert_eq!(
+            none.dm_access, None,
+            "no policy is published unless requested"
+        );
+
+        let builder = Bot::builder().accept_dms_from(DmAccess::Everyone);
+        assert_eq!(builder.dm_access, Some(DmAccess::Everyone));
     }
 }

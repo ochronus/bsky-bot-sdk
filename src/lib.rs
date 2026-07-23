@@ -97,7 +97,7 @@ pub use bot::{Bot, BotBuilder};
 pub use config::{BotConfig, DEFAULT_SERVICE};
 pub use context::{BotIdentity, Context};
 pub use dedup::Dedup;
-pub use dm::{DirectMessage, DmConfig, RawMessage};
+pub use dm::{DirectMessage, DmAccess, DmConfig, RawMessage};
 pub use embed::{MAX_IMAGES, PostBuilder};
 pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};

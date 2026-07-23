@@ -44,43 +44,24 @@
 //!
 //! **2. The bot's inbox must allow the sender.** Who may open a conversation with
 //! an account is controlled by that account's `chat.bsky.actor.declaration`
-//! record (`allowIncoming`: `"all"`, `"following"`, or `"none"`). The default
-//! blocks people the bot does not follow, so a bot that should receive DMs from
-//! *anyone* must publish a declaration with `allowIncoming = "all"` once. There is
-//! no builder shortcut yet; write the record through the underlying agent — for
-//! example, right after [`build`](crate::BotBuilder::build):
+//! record ([`DmAccess`]: `Everyone`, `Following`, or `Nobody`). The default blocks
+//! people the bot does not follow, so a bot that should receive DMs from *anyone*
+//! must publish [`DmAccess::Everyone`] once. Do it declaratively on the builder
+//! with [`accept_dms_from`](crate::BotBuilder::accept_dms_from):
 //!
-//! ```no_run
-//! # use bsky_bot_sdk::prelude::*;
-//! # use bsky_bot_sdk::atrium_api::chat::bsky::actor::declaration;
-//! # use bsky_bot_sdk::atrium_api::com::atproto::repo::put_record;
-//! # use bsky_bot_sdk::atrium_api::types::TryIntoUnknown;
-//! # async fn open_inbox(ctx: &Context) -> Result<()> {
-//! // Let anyone start a conversation with the bot.
-//! let record = declaration::RecordData { allow_incoming: "all".into() }
-//!     .try_into_unknown()
-//!     .expect("declaration serializes");
-//! ctx.agent()
-//!     .api
-//!     .com
-//!     .atproto
-//!     .repo
-//!     .put_record(
-//!         put_record::InputData {
-//!             collection: "chat.bsky.actor.declaration".parse().unwrap(),
-//!             record,
-//!             repo: ctx.did().parse().unwrap(),
-//!             rkey: "self".parse().unwrap(),
-//!             swap_commit: None,
-//!             swap_record: None,
-//!             validate: None,
-//!         }
-//!         .into(),
-//!     )
-//!     .await?;
-//! # Ok(())
+//! ```
+//! # use bsky_bot_sdk::Bot;
+//! # use bsky_bot_sdk::DmAccess;
+//! # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+//! b.accept_dms_from(DmAccess::Everyone)
+//!     .on_message(|ctx, dm| async move {
+//!         ctx.send_dm_to_convo(dm.convo_id(), "hi!").await?;
+//!         Ok(())
+//!     })
 //! # }
 //! ```
+//!
+//! …or at runtime with [`set_dm_access`](crate::Context::set_dm_access).
 //!
 //! Note that a recipient's own inbox setting also gates *sending*: a
 //! [`send_dm`](crate::Context::send_dm) to someone who restricts incoming messages
@@ -270,6 +251,38 @@ impl DmHandlers {
                     ),
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbox access
+// ---------------------------------------------------------------------------
+
+/// Who may start a direct-message conversation with the bot.
+///
+/// Mirrors the `allowIncoming` field of the `chat.bsky.actor.declaration` record.
+/// Apply it with [`accept_dms_from`](crate::BotBuilder::accept_dms_from) on the
+/// builder, or [`set_dm_access`](crate::Context::set_dm_access) at runtime. The
+/// account default blocks accounts the bot does not follow, so a bot that should
+/// receive DMs from anyone needs [`DmAccess::Everyone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmAccess {
+    /// Anyone may open a conversation with the bot.
+    Everyone,
+    /// Only accounts the bot follows may open a conversation with it.
+    Following,
+    /// No one may open a new conversation with the bot.
+    Nobody,
+}
+
+impl DmAccess {
+    /// The wire value for the `allowIncoming` field.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            DmAccess::Everyone => "all",
+            DmAccess::Following => "following",
+            DmAccess::Nobody => "none",
         }
     }
 }
@@ -715,5 +728,14 @@ mod tests {
             !cfg.process_backlog,
             "a restarting bot must not re-answer an old backlog by default",
         );
+    }
+
+    #[test]
+    fn dm_access_maps_to_the_lexicon_wire_values() {
+        // These strings are the `allowIncoming` enum in chat.bsky.actor.declaration;
+        // if a mapping drifts, the server would silently apply the wrong policy.
+        assert_eq!(DmAccess::Everyone.as_wire(), "all");
+        assert_eq!(DmAccess::Following.as_wire(), "following");
+        assert_eq!(DmAccess::Nobody.as_wire(), "none");
     }
 }

@@ -321,32 +321,23 @@ looks silent:
 
 2. **The bot's inbox must allow the sender.** Who may open a conversation with an
    account is controlled by that account's `chat.bsky.actor.declaration` record
-   (`allowIncoming`: `"all"`, `"following"`, or `"none"`). The default blocks
-   people the bot doesn't follow — so a bot that should accept DMs from *anyone*
-   has to publish `allowIncoming = "all"` once. There's no builder shortcut yet;
-   write the record through the underlying agent, e.g. right after `build()`:
+   (`DmAccess`: `Everyone`, `Following`, or `Nobody`). The default blocks people
+   the bot doesn't follow — so a bot that should accept DMs from *anyone* has to
+   publish `DmAccess::Everyone` once. Do it declaratively on the builder:
 
    ```rust
    # use bsky_bot_sdk::prelude::*;
-   # use bsky_bot_sdk::atrium_api::chat::bsky::actor::declaration;
-   # use bsky_bot_sdk::atrium_api::com::atproto::repo::put_record;
-   # use bsky_bot_sdk::atrium_api::types::TryIntoUnknown;
-   # async fn open_inbox(ctx: &Context) -> Result<()> {
-   let record = declaration::RecordData { allow_incoming: "all".into() }
-       .try_into_unknown()
-       .expect("declaration serializes");
-   ctx.agent().api.com.atproto.repo.put_record(put_record::InputData {
-       collection: "chat.bsky.actor.declaration".parse().unwrap(),
-       record,
-       repo: ctx.did().parse().unwrap(),
-       rkey: "self".parse().unwrap(),
-       swap_commit: None,
-       swap_record: None,
-       validate: None,
-   }.into()).await?;
-   # Ok(())
+   # fn demo(b: BotBuilder) -> BotBuilder {
+   b.accept_dms_from(DmAccess::Everyone)
+       .on_message(|ctx, dm| async move {
+           ctx.send_dm_to_convo(dm.convo_id(), "hi!").await?;
+           Ok(())
+       })
    # }
    ```
+
+   `accept_dms_from` publishes the record once on `build()`. For a runtime change,
+   call `ctx.set_dm_access(DmAccess::Everyone)`.
 
 A recipient's inbox setting also gates *sending*: `ctx.send_dm(did, …)` to someone
 who restricts incoming messages fails with a server `MessagesDisabled` error —

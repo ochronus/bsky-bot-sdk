@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-23
+
+### Added
+
+- **Direct-message inbox policy helpers.** A typed `DmAccess`
+  (`Everyone` / `Following` / `Nobody`) plus two ways to publish the bot's
+  `chat.bsky.actor.declaration` (`allowIncoming`) record, so a bot that should
+  receive DMs from non-followed accounts no longer has to hand-roll a `putRecord`:
+  - `BotBuilder::accept_dms_from(DmAccess)` — declarative; the record is written
+    once during `build()`.
+  - `Context::set_dm_access(DmAccess)` — the runtime primitive.
+  - The `dm_bot` example now calls `.accept_dms_from(DmAccess::Everyone)` so it
+    works out of the box.
+
 ## [0.6.0] - 2026-07-23
 
 ### Added
@@ -209,7 +223,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop driving with `poll_and_dispatch`.
 - Examples: `mention_bot`, `follow_back`, and `reactor`.
 
-[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.3.0...v0.4.0

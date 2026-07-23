@@ -7,10 +7,9 @@
 //! - Your **app password must have direct-message access** — a per-app-password
 //!   opt-in in Settings → Privacy and security → App passwords. Without it the
 //!   server rejects every chat call.
-//! - To receive DMs from accounts the bot does not follow, the bot's
-//!   `chat.bsky.actor.declaration` must set `allowIncoming = "all"` (the default
-//!   blocks non-followed senders). See the crate README / `dm` module docs for
-//!   the one-time record write that opens the inbox.
+//! - To receive DMs from accounts the bot does not follow, its inbox must allow
+//!   them. This bot calls `.accept_dms_from(DmAccess::Everyone)`, which publishes
+//!   the `chat.bsky.actor.declaration` record on startup.
 //!
 //! - incoming DM   → reply "echo: <text>" into the same conversation
 //! - startup       → optionally send a one-off hello to `GREET_DID`
@@ -42,6 +41,8 @@ async fn main() -> anyhow::Result<()> {
     let bot = Bot::builder()
         .from_env()?
         .session_file("session.json")
+        // Let anyone start a conversation with the bot (published once on startup).
+        .accept_dms_from(DmAccess::Everyone)
         .on_message(|ctx, dm| async move {
             tracing::info!(
                 from = dm.sender_did(),
