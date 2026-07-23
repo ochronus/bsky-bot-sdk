@@ -50,6 +50,7 @@ still needs the loop around it. This crate provides:
 | **Typed events** | `NotificationReason::{Mention, Reply, Follow, Like, Repost, Quote, …}` instead of magic strings. |
 | **Actions** | `ctx.reply_to`, `ctx.like`, `ctx.repost`, `ctx.follow_back`, `ctx.post`, `ctx.delete` — threading and facet detection handled for you. |
 | **Media & embeds** | `ctx.compose()` builds posts with images (**alt text required by type**), video, external link cards (auto-fetched OpenGraph), and quote posts — uploaded to your own PDS, so it works on any server. |
+| **Threads & auto-split** | `ctx.thread()` chains posts into a reply thread and splits long text at word boundaries into 300-grapheme posts, with optional `i/N` numbering. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
@@ -60,7 +61,7 @@ still needs the loop around it. This crate provides:
 
 ```toml
 [dependencies]
-bsky-bot-sdk = "0.4"
+bsky-bot-sdk = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -121,6 +122,7 @@ action helpers:
 
 - `ctx.post(text)` — new top-level post (facets auto-detected)
 - `ctx.compose()` — build a post with media/embeds (see below)
+- `ctx.thread()` — post a thread, auto-splitting long text (see below)
 - `ctx.reply_to(&notif, text)` — reply in-thread, root resolved automatically
 - `ctx.like(&notif)` / `ctx.repost(&notif)`
 - `ctx.follow_back(&notif)` / `ctx.follow(did)`
@@ -147,6 +149,7 @@ cargo run --example reactor           # mentions, replies, follows, likes, error
 cargo run --example scheduled_poster  # post the date/time once a day (no handlers)
 cargo run --example keyword_stream    # react to network-wide keywords/hashtags (Jetstream)
 cargo run --example media_bot         # reply with images / quotes / link cards
+cargo run --example thread_bot        # reply with an auto-split, numbered thread
 ```
 
 ## Media & embeds
@@ -192,6 +195,42 @@ optionally alongside a quote. **Alt text is required by the type signature** for
 images and video — omitting it is a compile error, not a lint. All blobs upload
 to the bot's own PDS, so media works the same on `bsky.social` and on
 third-party / self-hosted PDSes.
+
+## Threads & auto-split
+
+Bluesky caps a post at **300 graphemes**. When you have more to say, `ctx.thread()`
+publishes a connected reply chain and splits long text for you — at word
+boundaries, counting Unicode grapheme clusters the same way the server does, so a
+URL or `@mention` never gets cut in half and no post is ever rejected for length.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# async fn demo(ctx: Context, notif: Notification) -> Result<()> {
+# let essay = String::new();
+// Hand it a long string; get back one post per part, in order.
+let posts = ctx
+    .thread()
+    .reply_to(&notif)   // optional: hang the thread off a notification
+    .text(essay)        // split automatically when it overflows one post
+    .numbered()         // optional: tag each post " i/N"
+    .send()
+    .await?;
+println!("posted {} parts", posts.len());
+
+// Explicit multi-part threads work too — each piece is at least one post:
+ctx.thread()
+    .texts(["First thought.", "A follow-up.", "And the conclusion."])
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+Each `.text(..)` piece becomes at least one post (pieces are never merged); a
+piece longer than `MAX_POST_GRAPHEMES` is split across as many posts as it needs.
+`.numbered()` reserves grapheme budget for the ` i/N` suffix so numbered posts
+still fit, and leaves a single-post thread untagged. `.send()` returns one
+`create_record::Output` per post.
 
 ## Real-time streaming (Jetstream)
 

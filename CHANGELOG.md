@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-23
+
+### Added
+
+- **Threads with grapheme-aware auto-split.** A fluent `Context::thread()` builder
+  publishes a sequence of posts as a connected reply chain (each post replies to
+  the previous one; all share the thread root):
+  - `.text(piece)` / `.texts([...])` — add content. Each piece becomes at least
+    one post (pieces are never merged); a piece longer than the per-post limit is
+    split, at word boundaries, across as many posts as it needs.
+  - Splitting counts Unicode **extended grapheme clusters** — the same unit, via
+    the same `unicode-segmentation` crate, that Bluesky's 300-character limit and
+    `bsky-sdk`'s `RichText::grapheme_len` use — so the boundary matches what the
+    server enforces, and a grapheme cluster is never split across posts. Breaks
+    prefer whitespace, so URLs, `@mentions`, and `#hashtags` stay whole and their
+    facets are detected correctly.
+  - `.numbered()` — append a ` i/N` suffix to every post, reserving grapheme
+    budget for the suffix (via a fixed-point over the post count) so numbered
+    posts still fit the limit. A single-post thread is left un-numbered.
+  - `.reply_to(&notif)` / `.reply(parent, root)` — root the whole thread as a
+    reply, threading correctly; `.langs([...])` sets the language of every post.
+  - `.send().await` returns one `create_record::Output` per post, in order.
+  - Public `ThreadBuilder` type and `MAX_POST_GRAPHEMES` constant.
+  - Example: `thread_bot` (replies to mentions with an auto-split numbered thread).
+
+### Changed
+
+- Added `unicode-segmentation` as a direct dependency for grapheme-cluster
+  segmentation. It was already in the tree via `bsky-sdk`'s rich-text feature, so
+  declaring it directly adds no new crate and does not affect the MSRV.
+
 ## [0.4.0] - 2026-07-23
 
 ### Added
@@ -137,7 +168,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop driving with `poll_and_dispatch`.
 - Examples: `mention_bot`, `follow_back`, and `reactor`.
 
-[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.1.0...v0.2.0

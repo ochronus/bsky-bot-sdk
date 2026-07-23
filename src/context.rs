@@ -16,6 +16,7 @@ use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::WriteBudget;
+use crate::thread::ThreadBuilder;
 
 /// The bot's own account identity, resolved at login.
 #[derive(Debug, Clone)]
@@ -86,7 +87,7 @@ impl Context {
     // --- posting -----------------------------------------------------------
 
     /// Build a post record, auto-detecting mentions/links/tags as facets.
-    async fn build_post(
+    pub(crate) async fn build_post(
         &self,
         text: impl AsRef<str>,
         reply: Option<post::ReplyRef>,
@@ -140,6 +141,31 @@ impl Context {
     /// ```
     pub fn compose(&self) -> PostBuilder {
         PostBuilder::new(self.clone())
+    }
+
+    /// Start composing a multi-post thread.
+    ///
+    /// Returns a fluent [`ThreadBuilder`]: add pieces with
+    /// [`text`](ThreadBuilder::text) / [`texts`](ThreadBuilder::texts), optionally
+    /// [`reply_to`](ThreadBuilder::reply_to) a notification or
+    /// [`numbered`](ThreadBuilder::numbered) the posts, then call
+    /// [`send`](ThreadBuilder::send). Text over
+    /// [`MAX_POST_GRAPHEMES`](crate::MAX_POST_GRAPHEMES) is split, at word
+    /// boundaries, into as many posts as it needs.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.thread()
+    ///     .text("A long story that won't fit in one post …")
+    ///     .numbered()
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn thread(&self) -> ThreadBuilder {
+        ThreadBuilder::new(self.clone())
     }
 
     /// Upload raw bytes as a blob to the bot's own PDS, returning a blob ref you

@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
@@ -56,6 +56,13 @@ futures-util = { version = "0.3", default-features = false, features = [
 # second TLS stack is added. `gzip` lets us read compressed HTML for link cards.
 reqwest = { version = "0.12", features = ["gzip"] }
 
+# Grapheme-cluster segmentation for the 300-grapheme post limit and thread
+# auto-split. This is the same crate — and the same UAX #29 extended-grapheme
+# rule — that bsky-sdk's `RichText::grapheme_len` uses to count, so our split
+# boundary matches the one Bluesky's server enforces. Already in the tree via
+# bsky-sdk, so declaring it directly adds no new crate.
+unicode-segmentation = "1"
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -83,3 +90,7 @@ path = "examples/keyword_stream.rs"
 [[example]]
 name = "media_bot"
 path = "examples/media_bot.rs"
+
+[[example]]
+name = "thread_bot"
+path = "examples/thread_bot.rs"

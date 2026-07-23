@@ -22,6 +22,9 @@
 //!   [`PostBuilder`] for images (with **required** alt text), video, external
 //!   link cards (auto-fetched OpenGraph), and quote posts, all uploaded to the
 //!   bot's own PDS so they work on any server.
+//! - **Threads with auto-split** via [`ctx.thread()`](Context::thread) — a
+//!   [`ThreadBuilder`] that chains posts into a reply thread and splits text over
+//!   [`MAX_POST_GRAPHEMES`] at word boundaries, optionally numbering each part.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
@@ -81,6 +84,7 @@ mod handler;
 mod ratelimit;
 mod schedule;
 mod stream;
+mod thread;
 
 pub mod prelude;
 
@@ -98,6 +102,7 @@ pub use stream::{
     Backoff, CommitOp, DEFAULT_JETSTREAM_ENDPOINT, JetstreamConfig, RawCommit, RawStreamEvent,
     StreamEvent, StreamKind,
 };
+pub use thread::{MAX_POST_GRAPHEMES, ThreadBuilder};
 
 // Re-export the underlying crates for advanced use and to guarantee a single,
 // consistent version of the AT Protocol types across your app.
