@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
 use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
 use crate::ratelimit::{RateLimitConfig, WriteBudget};
+use crate::retry::{RetryPolicy, retry};
 use crate::schedule::{Schedule, Scheduler, boxed_task};
 use crate::stream::{
     JetstreamConfig, Matcher, StreamEvent, StreamHandlers, StreamRunner,
@@ -177,6 +178,25 @@ impl BotBuilder {
     /// Configure client-side write rate limiting. Pass `None` to disable.
     pub fn rate_limit(mut self, config: Option<RateLimitConfig>) -> Self {
         self.config.rate_limit = config;
+        self
+    }
+
+    /// Configure how transient failures (network blips, 5xx, throttling) are
+    /// retried on idempotent reads and the poll loops.
+    ///
+    /// Defaults to a few quick tries with jittered backoff, so a passing blip is
+    /// ridden out within a poll interval rather than costing a whole cycle. Record
+    /// *writes* are never auto-retried (a lost response could double-post). Pass
+    /// [`RetryPolicy::none()`] to disable retrying entirely.
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::{Bot, RetryPolicy};
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.retry_policy(RetryPolicy { max_retries: 5, ..RetryPolicy::default() })
+    /// # }
+    /// ```
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.config.retry = policy;
         self
     }
 
@@ -667,7 +687,7 @@ impl BotBuilder {
         // 6. Assemble the write budget (rate limiter + per-operation costs).
         let budget = WriteBudget::new(self.config.rate_limit.as_ref());
 
-        let context = Context::new(agent, identity, budget);
+        let context = Context::new(agent, identity, budget).with_retry(self.config.retry.clone());
 
         // 7. Publish the chat inbox policy, if one was requested. Done here so a
         //    bot that wants to accept DMs from anyone is configured before it
@@ -898,6 +918,9 @@ impl Bot {
     }
 
     /// Fetch the current page of notifications, applying any reason filter.
+    ///
+    /// A read, so transient failures are retried per the configured
+    /// [`RetryPolicy`](crate::RetryPolicy) rather than costing a whole poll cycle.
     async fn fetch(&self) -> Result<Vec<Notification>> {
         let limit = LimitedNonZeroU8::<100>::try_from(self.config.clamped_limit()).ok();
         let reasons = self.config.reasons.as_ref().map(|rs| {
@@ -906,45 +929,52 @@ impl Bot {
                 .collect::<Vec<_>>()
         });
 
-        let params = list_notifications::ParametersData {
-            cursor: None,
-            limit,
-            priority: None,
-            reasons,
-            seen_at: None,
-        };
-        let output = self
-            .context
-            .agent()
-            .api
-            .app
-            .bsky
-            .notification
-            .list_notifications(params.into())
-            .await?;
+        retry(&self.config.retry, || async {
+            let params = list_notifications::ParametersData {
+                cursor: None,
+                limit,
+                priority: None,
+                reasons: reasons.clone(),
+                seen_at: None,
+            };
+            let output = self
+                .context
+                .agent()
+                .api
+                .app
+                .bsky
+                .notification
+                .list_notifications(params.into())
+                .await?;
 
-        Ok(output
-            .data
-            .notifications
-            .into_iter()
-            .map(Notification::new)
-            .collect())
+            Ok(output
+                .data
+                .notifications
+                .into_iter()
+                .map(Notification::new)
+                .collect())
+        })
+        .await
     }
 
-    /// Mark notifications seen as of now.
+    /// Mark notifications seen as of now. Idempotent, so transient failures are
+    /// retried.
     async fn mark_seen(&self) -> Result<()> {
-        let input = update_seen::InputData {
-            seen_at: Datetime::now(),
-        };
-        self.context
-            .agent()
-            .api
-            .app
-            .bsky
-            .notification
-            .update_seen(input.into())
-            .await?;
-        Ok(())
+        retry(&self.config.retry, || async {
+            let input = update_seen::InputData {
+                seen_at: Datetime::now(),
+            };
+            self.context
+                .agent()
+                .api
+                .app
+                .bsky
+                .notification
+                .update_seen(input.into())
+                .await?;
+            Ok(())
+        })
+        .await
     }
 }
 

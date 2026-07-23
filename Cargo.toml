@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,

@@ -24,6 +24,7 @@ use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::WriteBudget;
+use crate::retry::{RetryPolicy, retry};
 use crate::self_label::{has_bot_label, set_bot_label};
 use crate::thread::ThreadBuilder;
 
@@ -116,6 +117,7 @@ pub struct Context {
     agent: BskyAgent,
     identity: Arc<BotIdentity>,
     budget: WriteBudget,
+    retry: RetryPolicy,
 }
 
 impl Context {
@@ -124,7 +126,14 @@ impl Context {
             agent,
             identity,
             budget,
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Override the retry policy applied to this context's idempotent reads.
+    pub(crate) fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// The authenticated agent, for calls not covered by the helpers below.
@@ -425,17 +434,23 @@ impl Context {
         let did: Did = did
             .parse()
             .map_err(|_| Error::invalid_input(format!("invalid DID: {did}")))?;
-        let output = self
-            .agent
-            .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .get_convo_for_members(
-                get_convo_for_members::ParametersData { members: vec![did] }.into(),
-            )
-            .await?;
-        Ok(output.data.convo.id.clone())
+        retry(&self.retry, || async {
+            let output = self
+                .agent
+                .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
+                .chat
+                .bsky
+                .convo
+                .get_convo_for_members(
+                    get_convo_for_members::ParametersData {
+                        members: vec![did.clone()],
+                    }
+                    .into(),
+                )
+                .await?;
+            Ok(output.data.convo.id.clone())
+        })
+        .await
     }
 
     /// Build a chat message record, auto-detecting mentions/links/tags as facets.
@@ -530,24 +545,34 @@ impl Context {
         let collection: Nsid = "app.bsky.actor.profile"
             .parse()
             .map_err(|_| Error::invalid_input("invalid profile collection NSID"))?;
-        let params = get_record::ParametersData {
-            cid: None,
-            collection,
-            repo: self.identity.did_typed().clone().into(),
-            rkey: profile_rkey()?,
-        };
-        let output = match self
-            .agent
-            .api
-            .com
-            .atproto
-            .repo
-            .get_record(params.into())
-            .await
-        {
-            Ok(output) => output,
-            Err(err) if is_record_not_found(&err) => return Ok(None),
-            Err(err) => return Err(err.into()),
+        let repo = self.identity.did_typed().clone();
+        // Retry transient failures; a `RecordNotFound` is mapped to `Ok(None)`
+        // *inside* the retried closure so it is never retried (it is not
+        // transient) and never confused with a real error.
+        let output = retry(&self.retry, || async {
+            let params = get_record::ParametersData {
+                cid: None,
+                collection: collection.clone(),
+                repo: repo.clone().into(),
+                rkey: profile_rkey()?,
+            };
+            match self
+                .agent
+                .api
+                .com
+                .atproto
+                .repo
+                .get_record(params.into())
+                .await
+            {
+                Ok(output) => Ok(Some(output)),
+                Err(err) if is_record_not_found(&err) => Ok(None),
+                Err(err) => Err(Error::from(err)),
+            }
+        })
+        .await?;
+        let Some(output) = output else {
+            return Ok(None);
         };
         let value = serde_json::to_value(&output.data.value)?;
         let record = serde_json::from_value(value)
@@ -558,15 +583,23 @@ impl Context {
     /// Fetch one page of the conversation-event log from `cursor`, used by the
     /// direct-message poll loop. Exposed to the crate's DM runner.
     pub(crate) async fn fetch_convo_log(&self, cursor: Option<String>) -> Result<get_log::Output> {
-        let output = self
-            .agent
-            .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
-            .chat
-            .bsky
-            .convo
-            .get_log(get_log::ParametersData { cursor }.into())
-            .await?;
-        Ok(output)
+        retry(&self.retry, || async {
+            let output = self
+                .agent
+                .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
+                .chat
+                .bsky
+                .convo
+                .get_log(
+                    get_log::ParametersData {
+                        cursor: cursor.clone(),
+                    }
+                    .into(),
+                )
+                .await?;
+            Ok(output)
+        })
+        .await
     }
 }
 

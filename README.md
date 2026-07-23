@@ -55,6 +55,7 @@ still needs the loop around it. This crate provides:
 | **Automated self-label** | `automated_label(true)` declares the account a bot on its profile (the guideline-recommended `bot` self-label), preserving everything else the profile already has. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
+| **Resilience** | Transient failures (network blips, 5xx, throttling) on the poll loops and idempotent reads are retried with jittered backoff (`retry_policy`); the Jetstream stream auto-reconnects. Writes are never blindly retried. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
 | **Scheduling** | Run actions on an interval or a cron schedule (`every`, `cron`) — many at once, alongside the notification loop. |
 | **Shutdown** | `run()` stops cleanly on `Ctrl-C`; `run_until(future)` stops on any signal you choose. |
@@ -406,6 +407,29 @@ You can also build a [`Schedule`] from a string and pass it to `schedule(...)`:
 `"@every 30m"` (simple interval syntax) or any cron expression / macro. An
 invalid cron expression is reported from `build()`, so the builder chain stays
 fluent. Scheduled-task errors are logged and never stop the loop.
+
+## Resilience
+
+A bot that dies — or stalls for a whole poll interval — on a passing network blip
+isn't production-grade. Transient failures (a bare transport error, an HTTP 5xx, a
+429, or a 408) on the **poll loops and idempotent reads** — `listNotifications`,
+`getLog`, `getRecord`, conversation resolution — are retried automatically with
+exponential backoff + jitter, so a blip is ridden out within a cycle. Permanent
+errors (bad input, auth, not-found) fail fast, un-retried. Tune it:
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b.retry_policy(RetryPolicy { max_retries: 5, ..RetryPolicy::default() })
+// or: .retry_policy(RetryPolicy::none()) to disable retrying
+# }
+```
+
+Record **writes are never auto-retried**: a create whose response is lost but that
+committed on the server would be duplicated by a blind retry (a double-post). The
+[Jetstream stream](#real-time-streaming-jetstream) reconnects on its own with the
+same backoff. Handler and scheduled-task errors are already isolated — one failing
+handler never aborts the batch or the loop.
 
 ## Rate limiting
 

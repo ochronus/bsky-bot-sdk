@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-23
+
+### Added
+
+- **Resilience: automatic retry of transient failures.** Transient errors
+  (bare transport failures, HTTP 5xx, 429, and 408) on the poll loops and
+  idempotent reads — `listNotifications`, `updateSeen`, `getLog`, `getRecord`,
+  and conversation resolution — are now retried with exponential backoff + jitter,
+  so a passing network blip is ridden out within a cycle instead of stalling it.
+  Permanent errors (bad input, auth, not-found) fail fast, un-retried.
+  - `RetryPolicy` (`max_retries` + a reused `Backoff`) configures it, via
+    `BotBuilder::retry_policy(...)` or `BotConfig::retry`. Default: 3 quick tries.
+    `RetryPolicy::none()` disables retrying.
+  - Record **writes are deliberately never auto-retried** — a lost response to a
+    committed create would double-post. (Safe write retries need an idempotency
+    key, a separate concern.)
+  - This completes the retry portion of the resilience roadmap item; the Jetstream
+    stream already auto-reconnects with the same backoff.
+
 ## [0.7.0] - 2026-07-23
 
 ### Added

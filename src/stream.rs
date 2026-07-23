@@ -516,7 +516,7 @@ impl Default for Backoff {
 
 impl Backoff {
     /// The base (un-jittered) delay for a zero-based `attempt`, capped at `max`.
-    fn base_delay(&self, attempt: u32) -> Duration {
+    pub(crate) fn base_delay(&self, attempt: u32) -> Duration {
         let grown = self.initial.as_secs_f64() * self.factor.powi(attempt as i32);
         Duration::from_secs_f64(grown.min(self.max.as_secs_f64()))
     }
@@ -524,7 +524,7 @@ impl Backoff {
     /// The delay for `attempt` with jitter applied. `jitter` in `[0, 1)` scales
     /// the base delay into `[50%, 100%]`, so retries spread out rather than
     /// stampeding in lock-step.
-    fn delay_with_jitter(&self, attempt: u32, jitter: f64) -> Duration {
+    pub(crate) fn delay_with_jitter(&self, attempt: u32, jitter: f64) -> Duration {
         let base = self.base_delay(attempt).as_secs_f64();
         Duration::from_secs_f64(base * (0.5 + 0.5 * jitter.clamp(0.0, 1.0)))
     }
@@ -605,7 +605,7 @@ fn build_subscribe_url(
 
 /// A sub-second jitter unit in `[0, 1)`, derived from the system clock so we do
 /// not need a random-number-generator dependency just to spread out reconnects.
-fn jitter_unit() -> f64 {
+pub(crate) fn jitter_unit() -> f64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())

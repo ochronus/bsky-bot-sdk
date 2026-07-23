@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::event::NotificationReason;
 use crate::ratelimit::RateLimitConfig;
+use crate::retry::RetryPolicy;
 
 /// The default Bluesky PDS entryway.
 pub const DEFAULT_SERVICE: &str = "https://bsky.social";
@@ -38,6 +39,11 @@ pub struct BotConfig {
     /// Optional client-side write rate limiting. `Some(_)` (the default) keeps the
     /// bot within Bluesky's points budget; `None` disables limiting entirely.
     pub rate_limit: Option<RateLimitConfig>,
+    /// How transient failures (network blips, 5xx, throttling) on idempotent
+    /// reads and the poll loops are retried. Defaults to a few quick tries so a
+    /// blip is ridden out within a poll interval. Record *writes* are never
+    /// auto-retried (that could double-post).
+    pub retry: RetryPolicy,
 }
 
 impl Default for BotConfig {
@@ -51,6 +57,7 @@ impl Default for BotConfig {
             mark_seen: true,
             session_path: None,
             rate_limit: Some(RateLimitConfig::default()),
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -79,6 +86,10 @@ mod tests {
         assert!(
             cfg.rate_limit.is_some(),
             "rate limiting on by default keeps bots within budget"
+        );
+        assert_eq!(
+            cfg.retry.max_retries, 3,
+            "transient reads should retry a few times by default"
         );
     }
 

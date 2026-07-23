@@ -33,6 +33,10 @@
 //!   [`automated_label`](BotBuilder::automated_label) — declare the account a bot
 //!   on its profile ([`BOT_SELF_LABEL`]), the guideline-recommended, cheap signal
 //!   that it's automated.
+//! - **Resilience** — transient failures (network blips, 5xx, throttling) on the
+//!   poll loops and idempotent reads are retried with jittered backoff (see
+//!   [`RetryPolicy`] and [`retry_policy`](BotBuilder::retry_policy)); the
+//!   Jetstream stream auto-reconnects. Record writes are never blindly retried.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
@@ -91,6 +95,7 @@ mod error;
 mod event;
 mod handler;
 mod ratelimit;
+mod retry;
 mod schedule;
 mod self_label;
 mod stream;
@@ -108,6 +113,7 @@ pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use retry::RetryPolicy;
 pub use schedule::{Schedule, Tz};
 pub use self_label::BOT_SELF_LABEL;
 pub use stream::{
