@@ -3,8 +3,12 @@
 
 use std::sync::Arc;
 
+use atrium_api::agent::AtprotoServiceType;
+use atrium_api::agent::bluesky::BSKY_CHAT_DID;
 use atrium_api::app::bsky::feed::{like, post, repost};
 use atrium_api::app::bsky::graph::follow;
+use atrium_api::chat::bsky::convo::defs::{MessageInput, MessageInputData};
+use atrium_api::chat::bsky::convo::{get_convo_for_members, get_log, send_message};
 use atrium_api::com::atproto::repo::{create_record, delete_record, strong_ref};
 use atrium_api::types::BlobRef;
 use atrium_api::types::string::{Datetime, Did, Handle};
@@ -12,11 +16,20 @@ use bsky_sdk::BskyAgent;
 use bsky_sdk::record::Record;
 use bsky_sdk::rich_text::RichText;
 
+use crate::dm::DirectMessage;
 use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::WriteBudget;
 use crate::thread::ThreadBuilder;
+
+/// The DID of the Bluesky chat service, reached via the `atproto-proxy` header.
+/// Parsed from the `atrium-api` constant; the value is a fixed, valid DID.
+fn chat_service_did() -> Result<Did> {
+    BSKY_CHAT_DID
+        .parse()
+        .map_err(|_| Error::invalid_input(format!("invalid chat service DID: {BSKY_CHAT_DID}")))
+}
 
 /// The bot's own account identity, resolved at login.
 #[derive(Debug, Clone)]
@@ -289,5 +302,114 @@ impl Context {
     pub async fn delete(&self, at_uri: impl AsRef<str>) -> Result<delete_record::Output> {
         self.budget.charge_delete().await;
         Ok(self.agent.delete_record(at_uri).await?)
+    }
+
+    // --- direct messages (chat.bsky.convo) ---------------------------------
+
+    /// Send a direct message to an actor by DID.
+    ///
+    /// Resolves (or creates) the one-to-one conversation with `did`, then sends
+    /// `text`, auto-detecting rich-text facets (mentions, links, hashtags) just
+    /// like [`post`](Context::post). Returns the sent message.
+    ///
+    /// If you are already handling a message and only want to reply, prefer
+    /// [`send_dm_to_convo`](Context::send_dm_to_convo) with the incoming
+    /// [`DirectMessage::convo_id`](crate::DirectMessage::convo_id) — it skips the
+    /// conversation lookup.
+    ///
+    /// **Requires an app password with direct-message access**, enabled per
+    /// app-password in the Bluesky settings.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.send_dm("did:plc:somebody000000000000000", "👋 hi from my bot!")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn send_dm(
+        &self,
+        did: impl AsRef<str>,
+        text: impl AsRef<str>,
+    ) -> Result<DirectMessage> {
+        let convo_id = self.convo_id_for(did).await?;
+        self.send_dm_to_convo(convo_id, text).await
+    }
+
+    /// Send a direct message into an existing conversation by id.
+    ///
+    /// The efficient way to reply from an [`on_message`](crate::BotBuilder::on_message)
+    /// handler: pass the [`DirectMessage::convo_id`](crate::DirectMessage::convo_id)
+    /// you were handed. Facets are detected automatically. Returns the sent
+    /// message.
+    pub async fn send_dm_to_convo(
+        &self,
+        convo_id: impl Into<String>,
+        text: impl AsRef<str>,
+    ) -> Result<DirectMessage> {
+        let convo_id = convo_id.into();
+        let message = self.build_message(text).await?;
+        self.budget.charge_create().await;
+        let output = self
+            .agent
+            .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
+            .chat
+            .bsky
+            .convo
+            .send_message(
+                send_message::InputData {
+                    convo_id: convo_id.clone(),
+                    message,
+                }
+                .into(),
+            )
+            .await?;
+        Ok(DirectMessage::new(output, convo_id))
+    }
+
+    /// Resolve the id of the one-to-one conversation with an actor DID, creating
+    /// it if it does not yet exist.
+    pub async fn convo_id_for(&self, did: impl AsRef<str>) -> Result<String> {
+        let did = did.as_ref();
+        let did: Did = did
+            .parse()
+            .map_err(|_| Error::invalid_input(format!("invalid DID: {did}")))?;
+        let output = self
+            .agent
+            .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
+            .chat
+            .bsky
+            .convo
+            .get_convo_for_members(
+                get_convo_for_members::ParametersData { members: vec![did] }.into(),
+            )
+            .await?;
+        Ok(output.data.convo.id.clone())
+    }
+
+    /// Build a chat message record, auto-detecting mentions/links/tags as facets.
+    async fn build_message(&self, text: impl AsRef<str>) -> Result<MessageInput> {
+        let rich = RichText::new_with_detect_facets(text).await?;
+        Ok(MessageInputData {
+            embed: None,
+            facets: rich.facets,
+            text: rich.text,
+        }
+        .into())
+    }
+
+    /// Fetch one page of the conversation-event log from `cursor`, used by the
+    /// direct-message poll loop. Exposed to the crate's DM runner.
+    pub(crate) async fn fetch_convo_log(&self, cursor: Option<String>) -> Result<get_log::Output> {
+        let output = self
+            .agent
+            .api_with_proxy(chat_service_did()?, AtprotoServiceType::BskyChat)
+            .chat
+            .bsky
+            .convo
+            .get_log(get_log::ParametersData { cursor }.into())
+            .await?;
+        Ok(output)
     }
 }

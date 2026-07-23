@@ -25,6 +25,10 @@
 //! - **Threads with auto-split** via [`ctx.thread()`](Context::thread) — a
 //!   [`ThreadBuilder`] that chains posts into a reply thread and splits text over
 //!   [`MAX_POST_GRAPHEMES`] at word boundaries, optionally numbering each part.
+//! - **Direct messages** via [`on_message`](BotBuilder::on_message) and
+//!   [`ctx.send_dm`](Context::send_dm) — react to private
+//!   [`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat) conversations
+//!   and reply, the bot's own messages filtered out so an echo cannot loop.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
@@ -77,6 +81,7 @@ mod bot;
 mod config;
 mod context;
 mod dedup;
+mod dm;
 mod embed;
 mod error;
 mod event;
@@ -92,6 +97,7 @@ pub use bot::{Bot, BotBuilder};
 pub use config::{BotConfig, DEFAULT_SERVICE};
 pub use context::{BotIdentity, Context};
 pub use dedup::Dedup;
+pub use dm::{DirectMessage, DmConfig, RawMessage};
 pub use embed::{MAX_IMAGES, PostBuilder};
 pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};

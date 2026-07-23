@@ -51,6 +51,7 @@ still needs the loop around it. This crate provides:
 | **Actions** | `ctx.reply_to`, `ctx.like`, `ctx.repost`, `ctx.follow_back`, `ctx.post`, `ctx.delete` — threading and facet detection handled for you. |
 | **Media & embeds** | `ctx.compose()` builds posts with images (**alt text required by type**), video, external link cards (auto-fetched OpenGraph), and quote posts — uploaded to your own PDS, so it works on any server. |
 | **Threads & auto-split** | `ctx.thread()` chains posts into a reply thread and splits long text at word boundaries into 300-grapheme posts, with optional `i/N` numbering. |
+| **Direct messages** | `on_message` reacts to private [`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat) conversations; `ctx.send_dm` / `ctx.send_dm_to_convo` reply. The bot's own messages are filtered out, so an echo cannot loop. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
@@ -126,6 +127,7 @@ action helpers:
 - `ctx.reply_to(&notif, text)` — reply in-thread, root resolved automatically
 - `ctx.like(&notif)` / `ctx.repost(&notif)`
 - `ctx.follow_back(&notif)` / `ctx.follow(did)`
+- `ctx.send_dm(did, text)` / `ctx.send_dm_to_convo(convo_id, text)` — direct messages (see below)
 - `ctx.delete(at_uri)`
 - `ctx.agent()` — drop down to raw `bsky-sdk` for anything not covered
 
@@ -150,6 +152,7 @@ cargo run --example scheduled_poster  # post the date/time once a day (no handle
 cargo run --example keyword_stream    # react to network-wide keywords/hashtags (Jetstream)
 cargo run --example media_bot         # reply with images / quotes / link cards
 cargo run --example thread_bot        # reply with an auto-split, numbered thread
+cargo run --example dm_bot            # echo direct messages (chat.bsky.convo)
 ```
 
 ## Media & embeds
@@ -274,6 +277,80 @@ a time-based cursor so a reconnect resumes without gaps. Tune the endpoint,
 collection/DID filters, and starting cursor with `jetstream_endpoint`,
 `jetstream_collections`, `jetstream_dids`, and `jetstream_cursor` (or replace the
 whole `JetstreamConfig`). Compression (`zstd`) is not yet supported.
+
+## Direct messages
+
+Bots can also react to **private conversations** on Bluesky's chat
+([`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat)). Register
+`on_message` and reply with `ctx.send_dm` or — the cheaper path when you already
+have the incoming message — `ctx.send_dm_to_convo`. Message handlers run
+concurrently with the notification loop, the stream, and schedules; a bot may run
+with *only* message handlers.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b.on_message(|ctx, dm| async move {
+    // `dm.convo_id()` lets us reply without re-resolving the conversation.
+    ctx.send_dm_to_convo(dm.convo_id(), format!("echo: {}", dm.text()))
+        .await?;
+    Ok(())
+})
+# }
+```
+
+To start a conversation from a DID (rather than replying to one), use
+`ctx.send_dm(did, text)`, which resolves — or creates — the one-to-one
+conversation, then sends. The bot's own messages are never delivered to
+`on_message`, so an echo handler like the one above cannot loop.
+
+Under the hood the runner polls
+[`chat.bsky.convo.getLog`](https://docs.bsky.app/docs/api/chat-bsky-convo-get-log),
+the cursor-based conversation-event log. Like the notification loop it skips the
+pre-startup backlog by default (opt in with `process_dm_backlog(true)`); tune the
+cadence with `dm_poll_interval` (default 5s) or replace the whole `DmConfig`.
+
+### Two settings gate direct messages
+
+Chat is off unless two things are true — worth knowing before you wonder why a bot
+looks silent:
+
+1. **The app password needs DM access.** It's a per-app-password opt-in
+   (Settings → Privacy and security → App passwords). A password without it has
+   every chat call rejected by the server.
+
+2. **The bot's inbox must allow the sender.** Who may open a conversation with an
+   account is controlled by that account's `chat.bsky.actor.declaration` record
+   (`allowIncoming`: `"all"`, `"following"`, or `"none"`). The default blocks
+   people the bot doesn't follow — so a bot that should accept DMs from *anyone*
+   has to publish `allowIncoming = "all"` once. There's no builder shortcut yet;
+   write the record through the underlying agent, e.g. right after `build()`:
+
+   ```rust
+   # use bsky_bot_sdk::prelude::*;
+   # use bsky_bot_sdk::atrium_api::chat::bsky::actor::declaration;
+   # use bsky_bot_sdk::atrium_api::com::atproto::repo::put_record;
+   # use bsky_bot_sdk::atrium_api::types::TryIntoUnknown;
+   # async fn open_inbox(ctx: &Context) -> Result<()> {
+   let record = declaration::RecordData { allow_incoming: "all".into() }
+       .try_into_unknown()
+       .expect("declaration serializes");
+   ctx.agent().api.com.atproto.repo.put_record(put_record::InputData {
+       collection: "chat.bsky.actor.declaration".parse().unwrap(),
+       record,
+       repo: ctx.did().parse().unwrap(),
+       rkey: "self".parse().unwrap(),
+       swap_commit: None,
+       swap_record: None,
+       validate: None,
+   }.into()).await?;
+   # Ok(())
+   # }
+   ```
+
+A recipient's inbox setting also gates *sending*: `ctx.send_dm(did, …)` to someone
+who restricts incoming messages fails with a server `MessagesDisabled` error —
+expected, not a bug.
 
 ## Scheduling
 

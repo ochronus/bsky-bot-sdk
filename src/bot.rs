@@ -15,6 +15,9 @@ use bsky_sdk::agent::config::{Config, FileStore};
 use crate::config::BotConfig;
 use crate::context::{BotIdentity, Context};
 use crate::dedup::Dedup;
+use crate::dm::{
+    DirectMessage, DmConfig, DmHandlers, DmRunner, boxed_dm_error_handler, boxed_dm_handler,
+};
 use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
 use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
@@ -72,6 +75,8 @@ pub struct BotBuilder {
     scheduler: Scheduler,
     stream_config: JetstreamConfig,
     stream_handlers: StreamHandlers,
+    dm_config: DmConfig,
+    dm_handlers: DmHandlers,
     /// The first error from a fallible scheduling call (e.g. a bad cron
     /// expression), surfaced from [`build`](BotBuilder::build) so the builder
     /// chain stays fluent.
@@ -463,6 +468,75 @@ impl BotBuilder {
         self
     }
 
+    // --- direct messages (chat.bsky.convo) ---------------------------------
+
+    /// React to incoming direct messages.
+    ///
+    /// The handler receives a [`DirectMessage`] for each new message in any of
+    /// the bot's conversations. Runs concurrently with the notification loop, the
+    /// scheduler, and the Jetstream stream (a bot may run with *only* message
+    /// handlers). Messages the bot itself sent are never delivered, so an echo
+    /// handler cannot loop.
+    ///
+    /// **Requires an app password with direct-message access** (a per-app-password
+    /// opt-in in the Bluesky settings); without it the server rejects chat calls.
+    /// To receive messages from accounts the bot does not follow, the bot's
+    /// `chat.bsky.actor.declaration` must also allow them (`allowIncoming = "all"`);
+    /// see [`DirectMessage`] and the crate README for how to open the inbox.
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.on_message(|ctx, dm| async move {
+    ///     ctx.send_dm_to_convo(dm.convo_id(), format!("you said: {}", dm.text()))
+    ///         .await?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn on_message<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, DirectMessage) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.dm_handlers.push(boxed_dm_handler(handler));
+        self
+    }
+
+    /// Register an error handler for message handlers, mirroring
+    /// [`on_error`](Self::on_error). Without one, message handler errors are
+    /// logged via `tracing`.
+    pub fn on_message_error<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, DirectMessage, Error) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.dm_handlers.set_error(boxed_dm_error_handler(handler));
+        self
+    }
+
+    /// Set the interval between direct-message polls (default 5s).
+    pub fn dm_poll_interval(mut self, interval: Duration) -> Self {
+        self.dm_config.poll_interval = interval;
+        self
+    }
+
+    /// Process the backlog of direct messages that existed before startup.
+    ///
+    /// Off by default, so a restarting bot does not re-answer an old conversation
+    /// backlog (mirrors [`process_backlog`](Self::process_backlog) for
+    /// notifications).
+    pub fn process_dm_backlog(mut self, process: bool) -> Self {
+        self.dm_config.process_backlog = process;
+        self
+    }
+
+    /// Replace the entire [`DmConfig`] at once.
+    pub fn dm_config(mut self, config: DmConfig) -> Self {
+        self.dm_config = config;
+        self
+    }
+
     // --- build -------------------------------------------------------------
 
     /// Authenticate (resuming a saved session if possible, otherwise logging in)
@@ -539,6 +613,8 @@ impl BotBuilder {
             scheduler: self.scheduler,
             stream_config: self.stream_config,
             stream_handlers: self.stream_handlers,
+            dm_config: self.dm_config,
+            dm_handlers: self.dm_handlers,
         })
     }
 }
@@ -552,6 +628,8 @@ pub struct Bot {
     scheduler: Scheduler,
     stream_config: JetstreamConfig,
     stream_handlers: StreamHandlers,
+    dm_config: DmConfig,
+    dm_handlers: DmHandlers,
 }
 
 impl Bot {
@@ -597,8 +675,8 @@ impl Bot {
     /// shutdown.
     ///
     /// Returns [`Error::NoHandlers`] immediately if no notification handler, no
-    /// stream handler, and no scheduled job were registered — the bot would have
-    /// nothing to do.
+    /// stream handler, no message handler, and no scheduled job were registered —
+    /// the bot would have nothing to do.
     ///
     /// [Jetstream]: https://docs.bsky.app/blog/jetstream
     pub async fn run_until<F>(self, shutdown: F) -> Result<()>
@@ -606,7 +684,8 @@ impl Bot {
         F: Future<Output = ()>,
     {
         let has_stream = !self.stream_handlers.is_empty();
-        if self.handlers.is_empty() && self.scheduler.is_empty() && !has_stream {
+        let has_dm = !self.dm_handlers.is_empty();
+        if self.handlers.is_empty() && self.scheduler.is_empty() && !has_stream && !has_dm {
             return Err(Error::NoHandlers);
         }
 
@@ -631,12 +710,19 @@ impl Bot {
             ));
             tracing::info!("jetstream ingestion started");
         }
+        if has_dm {
+            let runner = DmRunner::new(self.dm_config.clone(), self.dm_handlers.clone());
+            background.push(tokio::spawn(
+                runner.run(self.context.clone(), shutdown_rx.clone()),
+            ));
+            tracing::info!("dm ingestion started");
+        }
 
         tokio::pin!(shutdown);
 
         if self.handlers.is_empty() {
             // No notification handlers: nothing to poll, so just wait for
-            // shutdown while the background tasks (stream / schedules) run.
+            // shutdown while the background tasks (stream / dm / schedules) run.
             tracing::info!(
                 handle = %self.context.handle(),
                 did = %self.context.did(),
@@ -850,7 +936,12 @@ mod tests {
 
     /// Build a `Bot` without any network I/O (an agent with no session performs
     /// none), for exercising the run loop's start-up guards.
-    async fn offline_bot(with_schedule: bool, with_handler: bool, with_stream: bool) -> Bot {
+    async fn offline_bot(
+        with_schedule: bool,
+        with_handler: bool,
+        with_stream: bool,
+        with_dm: bool,
+    ) -> Bot {
         let agent = bsky_sdk::BskyAgent::builder()
             .build()
             .await
@@ -881,6 +972,10 @@ mod tests {
                 boxed_stream_handler(|_c, _e| async move { Ok(()) }),
             );
         }
+        let mut dm_handlers = DmHandlers::default();
+        if with_dm {
+            dm_handlers.push(boxed_dm_handler(|_c, _m| async move { Ok(()) }));
+        }
 
         Bot {
             context,
@@ -889,22 +984,24 @@ mod tests {
             scheduler,
             stream_config: JetstreamConfig::default(),
             stream_handlers,
+            dm_config: DmConfig::default(),
+            dm_handlers,
         }
     }
 
     #[tokio::test]
     async fn run_until_errors_when_there_is_nothing_to_do() {
-        let bot = offline_bot(false, false, false).await;
+        let bot = offline_bot(false, false, false, false).await;
         let result = bot.run_until(async {}).await;
         assert!(
             matches!(result, Err(Error::NoHandlers)),
-            "a bot with no handlers, schedules, or stream should refuse to run",
+            "a bot with no handlers, schedules, stream, or dm should refuse to run",
         );
     }
 
     #[tokio::test]
     async fn run_until_with_only_a_schedule_runs_and_stops_cleanly() {
-        let bot = offline_bot(true, false, false).await;
+        let bot = offline_bot(true, false, false, false).await;
         // Immediate shutdown. With no handlers there is no polling (no network);
         // the scheduled job is spawned and then cancelled cooperatively.
         let result = bot.run_until(async {}).await;
@@ -916,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_until_with_only_a_stream_runs_and_stops_cleanly() {
-        let bot = offline_bot(false, false, true).await;
+        let bot = offline_bot(false, false, true, false).await;
         // Immediate shutdown on the current-thread test runtime: the spawned
         // stream runner is only polled once the main task awaits the join, by
         // which point the shutdown flag is already set — so it exits at the top
@@ -926,5 +1023,32 @@ mod tests {
             result.is_ok(),
             "a stream-only bot must run without erroring as NoHandlers: {result:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn run_until_with_only_a_dm_handler_runs_and_stops_cleanly() {
+        let bot = offline_bot(false, false, false, true).await;
+        // Same reasoning as the stream-only case: the spawned DM runner sees the
+        // shutdown flag already set and exits before any network call.
+        let result = bot.run_until(async {}).await;
+        assert!(
+            result.is_ok(),
+            "a dm-only bot must run without erroring as NoHandlers: {result:?}",
+        );
+    }
+
+    #[test]
+    fn builder_registers_message_handler_and_dm_config() {
+        let builder = Bot::builder()
+            .dm_poll_interval(Duration::from_secs(9))
+            .process_dm_backlog(true)
+            .on_message(|_c, _m| async move { Ok(()) });
+
+        assert!(
+            !builder.dm_handlers.is_empty(),
+            "on_message should register"
+        );
+        assert_eq!(builder.dm_config.poll_interval, Duration::from_secs(9));
+        assert!(builder.dm_config.process_backlog);
     }
 }

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-23
+
+### Added
+
+- **Direct messages (`chat.bsky.convo`).** Bots can now react to and send private
+  messages, rounding out the reactive surface:
+  - `on_message(|ctx, dm| …)` registers a handler invoked for each new direct
+    message across all of the bot's conversations. Runs concurrently with the
+    notification loop, the Jetstream stream, and schedules; a bot may run with
+    *only* message handlers. `on_message_error` mirrors `on_error` for message
+    handlers.
+  - Messages the bot itself sent are filtered out before dispatch, so an echo
+    handler cannot loop.
+  - `Context::send_dm(did, text)` resolves (or creates) the one-to-one
+    conversation with an actor and sends a message, detecting rich-text facets
+    like `post`. `Context::send_dm_to_convo(convo_id, text)` sends into a known
+    conversation — the efficient way to reply from a handler.
+    `Context::convo_id_for(did)` exposes the conversation lookup on its own.
+  - `DirectMessage` wrapper with typed accessors (`convo_id`, `id`, `rev`,
+    `sender_did`, `text`, `sent_at`, `raw`), mirroring `Notification` /
+    `StreamEvent`. Public `DmConfig` and `RawMessage` types.
+  - Ingestion polls `chat.bsky.convo.getLog` (the cursor-based conversation-event
+    log). It skips the pre-startup backlog by default — opt in with
+    `process_dm_backlog(true)` — and the poll cadence is tunable via
+    `dm_poll_interval` (default 5s) or a full `DmConfig`.
+  - Example: `dm_bot` (echoes incoming DMs; optional startup greeting by DID).
+
+### Notes
+
+- Direct messages require an **app password with direct-message access** (a
+  per-app-password opt-in in the Bluesky settings). Chat calls are routed through
+  the `api.bsky.chat` service via the `atproto-proxy` header. No new dependency:
+  the `chat.bsky.convo` types were already available through `atrium-api`'s
+  `bluesky` feature.
+- To **receive** DMs from accounts the bot does not follow, the bot's
+  `chat.bsky.actor.declaration` record must set `allowIncoming = "all"` (the
+  default blocks non-followed senders). There is no builder shortcut yet; the
+  README and the `dm` module docs show how to publish it through the agent.
+  Live-validated end-to-end against the real network (including a third-party
+  PDS).
+
 ## [0.5.0] - 2026-07-23
 
 ### Added
@@ -168,7 +209,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop driving with `poll_and_dispatch`.
 - Examples: `mention_bot`, `follow_back`, and `reactor`.
 
-[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.2.0...v0.3.0
