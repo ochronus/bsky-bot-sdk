@@ -18,6 +18,10 @@
 //!   [`like`](Context::like), [`repost`](Context::repost),
 //!   [`follow_back`](Context::follow_back), [`post`](Context::post) — with
 //!   automatic rich-text facet detection (mentions, links, hashtags).
+//! - **Media & embeds** via [`ctx.compose()`](Context::compose) — a
+//!   [`PostBuilder`] for images (with **required** alt text), video, external
+//!   link cards (auto-fetched OpenGraph), and quote posts, all uploaded to the
+//!   bot's own PDS so they work on any server.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
@@ -70,6 +74,7 @@ mod bot;
 mod config;
 mod context;
 mod dedup;
+mod embed;
 mod error;
 mod event;
 mod handler;
@@ -83,6 +88,7 @@ pub use bot::{Bot, BotBuilder};
 pub use config::{BotConfig, DEFAULT_SERVICE};
 pub use context::{BotIdentity, Context};
 pub use dedup::Dedup;
+pub use embed::{MAX_IMAGES, PostBuilder};
 pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;

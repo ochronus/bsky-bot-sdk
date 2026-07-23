@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
@@ -50,6 +50,12 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
 ] }
 
+# Media & embeds: fetching OpenGraph metadata for link cards and driving the
+# Bluesky video-upload service. reqwest is already in the tree (atrium's default
+# client) and uses native-tls — the same TLS backend as tokio-tungstenite, so no
+# second TLS stack is added. `gzip` lets us read compressed HTML for link cards.
+reqwest = { version = "0.12", features = ["gzip"] }
+
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -73,3 +79,7 @@ path = "examples/scheduled_poster.rs"
 [[example]]
 name = "keyword_stream"
 path = "examples/keyword_stream.rs"
+
+[[example]]
+name = "media_bot"
+path = "examples/media_bot.rs"

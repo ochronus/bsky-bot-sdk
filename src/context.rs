@@ -6,11 +6,13 @@ use std::sync::Arc;
 use atrium_api::app::bsky::feed::{like, post, repost};
 use atrium_api::app::bsky::graph::follow;
 use atrium_api::com::atproto::repo::{create_record, delete_record, strong_ref};
+use atrium_api::types::BlobRef;
 use atrium_api::types::string::{Datetime, Did, Handle};
 use bsky_sdk::BskyAgent;
 use bsky_sdk::record::Record;
 use bsky_sdk::rich_text::RichText;
 
+use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::WriteBudget;
@@ -115,6 +117,51 @@ impl Context {
     pub async fn post_record(&self, record: post::RecordData) -> Result<create_record::Output> {
         self.budget.charge_create().await;
         Ok(record.create(&self.agent).await?)
+    }
+
+    /// Start composing a post with rich media and embeds.
+    ///
+    /// Returns a fluent [`PostBuilder`]: chain [`image`](PostBuilder::image)
+    /// (alt text required), [`video`](PostBuilder::video),
+    /// [`link_card`](PostBuilder::link_card), [`quote`](PostBuilder::quote), …
+    /// then call [`send`](PostBuilder::send). For a plain text post,
+    /// [`post`](Context::post) is the one-liner.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.compose()
+    ///     .text("first post with a picture!")
+    ///     .image(std::fs::read("photo.jpg")?, "A sunset over the ocean")
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn compose(&self) -> PostBuilder {
+        PostBuilder::new(self.clone())
+    }
+
+    /// Upload raw bytes as a blob to the bot's own PDS, returning a blob ref you
+    /// can place into a custom record. Works on any PDS.
+    ///
+    /// Most callers want [`compose`](Context::compose) instead, which uploads and
+    /// embeds media for you (and stamps the correct MIME type). Use this directly
+    /// only for advanced records the builder does not cover.
+    ///
+    /// Blob uploads are governed by a separate server limit and are *not* charged
+    /// against the client-side points budget (which models repo writes); only the
+    /// final `createRecord` is.
+    pub async fn upload_blob(&self, bytes: impl Into<Vec<u8>>) -> Result<BlobRef> {
+        let out = self
+            .agent
+            .api
+            .com
+            .atproto
+            .repo
+            .upload_blob(bytes.into())
+            .await?;
+        Ok(out.data.blob)
     }
 
     // --- replies -----------------------------------------------------------

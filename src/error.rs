@@ -35,6 +35,15 @@ pub enum Error {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// An HTTP request outside the XRPC client failed — fetching OpenGraph
+    /// metadata for a link card, or talking to the Bluesky video service.
+    #[error("http error: {0}")]
+    Http(String),
+
+    /// The Bluesky video-upload service reported a failed or timed-out job.
+    #[error("video upload failed: {0}")]
+    VideoUpload(String),
+
     /// A filesystem error while reading/writing the session file.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -48,6 +57,11 @@ impl Error {
     /// Construct an [`Error::InvalidInput`] from any displayable value.
     pub fn invalid_input(msg: impl core::fmt::Display) -> Self {
         Error::InvalidInput(msg.to_string())
+    }
+
+    /// Construct an [`Error::Http`] from any displayable value.
+    pub fn http(msg: impl core::fmt::Display) -> Self {
+        Error::Http(msg.to_string())
     }
 }
 

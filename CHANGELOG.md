@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
+### Added
+
+- **Media & embeds.** A fluent post builder, `Context::compose()`, attaches rich
+  media and embeds to a post; every builder method is synchronous and all network
+  work happens once in `PostBuilder::send().await`:
+  - `.image(bytes, alt)` — attach an image (up to 4), with **alt text required at
+    the type level**: it is a mandatory argument, so a post without a description
+    is a compile error, not a lint. `.image_with(bytes, alt, mime)` declares an
+    explicit MIME type. The type is otherwise sniffed from the image bytes (PNG,
+    JPEG, GIF, WebP).
+  - `.video(bytes, alt)` — attach an MP4, uploaded through the Bluesky video
+    service (service-auth → `video.bsky.app` → job polling). Alt text is required
+    here too.
+  - `.link_card(url)` — attach an external link "card": the URL is fetched, its
+    OpenGraph / Twitter-card metadata parsed, and any preview image uploaded as
+    the thumbnail. `.external(uri, title, description)` builds a card with no
+    fetching.
+  - `.quote(&notif)` / `.quote_ref(strong_ref)` — quote-post a record. Quoting
+    combined with media produces a `recordWithMedia` embed automatically.
+  - `.reply_to(&notif)` / `.reply(parent, root)`, `.text(..)`, and `.langs(..)`.
+  - `Context::upload_blob(bytes)` — upload a raw blob to the bot's own PDS for
+    advanced/custom records.
+  - Public `PostBuilder` type and `MAX_IMAGES` constant.
+  - Example: `media_bot` (replies to mentions with images / quotes / link cards).
+- All media is uploaded to the bot's **own PDS**, so images and link-card
+  thumbnails work identically on `bsky.social` and third-party / self-hosted
+  PDSes. Uploaded blobs are re-stamped with the sniffed MIME type so rendering
+  does not depend on a given PDS's content-type handling. Verified end-to-end
+  against a third-party PDS.
+
+### Changed
+
+- New error variants `Error::Http` and `Error::VideoUpload` for outbound
+  link-card fetches and the video service (both `#[non_exhaustive]`-compatible).
+- Added `reqwest` (with `gzip`) as a direct dependency for OpenGraph fetching and
+  the video service. It was already in the tree via atrium's default client and
+  uses `native-tls` — no second TLS stack.
+
 ## [0.3.0] - 2026-07-23
 
 ### Added
@@ -97,6 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop driving with `poll_and_dispatch`.
 - Examples: `mention_bot`, `follow_back`, and `reactor`.
 
-[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ochronus/bsky-bot-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ochronus/bsky-bot-sdk/releases/tag/v0.1.0

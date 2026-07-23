@@ -49,6 +49,7 @@ still needs the loop around it. This crate provides:
 | **De-duplication** | A watermark tracker (`Dedup`) that survives restarts and breaks timestamp ties, so you never double-reply. |
 | **Typed events** | `NotificationReason::{Mention, Reply, Follow, Like, Repost, Quote, …}` instead of magic strings. |
 | **Actions** | `ctx.reply_to`, `ctx.like`, `ctx.repost`, `ctx.follow_back`, `ctx.post`, `ctx.delete` — threading and facet detection handled for you. |
+| **Media & embeds** | `ctx.compose()` builds posts with images (**alt text required by type**), video, external link cards (auto-fetched OpenGraph), and quote posts — uploaded to your own PDS, so it works on any server. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
@@ -59,7 +60,7 @@ still needs the loop around it. This crate provides:
 
 ```toml
 [dependencies]
-bsky-bot-sdk = "0.3"
+bsky-bot-sdk = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -119,6 +120,7 @@ agent, the bot's own identity (`ctx.me()`, `ctx.did()`, `ctx.handle()`), and the
 action helpers:
 
 - `ctx.post(text)` — new top-level post (facets auto-detected)
+- `ctx.compose()` — build a post with media/embeds (see below)
 - `ctx.reply_to(&notif, text)` — reply in-thread, root resolved automatically
 - `ctx.like(&notif)` / `ctx.repost(&notif)`
 - `ctx.follow_back(&notif)` / `ctx.follow(did)`
@@ -144,7 +146,52 @@ cargo run --example follow_back       # follow back new followers
 cargo run --example reactor           # mentions, replies, follows, likes, error handling
 cargo run --example scheduled_poster  # post the date/time once a day (no handlers)
 cargo run --example keyword_stream    # react to network-wide keywords/hashtags (Jetstream)
+cargo run --example media_bot         # reply with images / quotes / link cards
 ```
+
+## Media & embeds
+
+`ctx.compose()` returns a fluent `PostBuilder`. Every method is synchronous and
+just records intent; the uploads, OpenGraph fetches, and video processing all
+happen once, when you `await` `.send()`.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# async fn demo(ctx: Context, notif: Notification) -> Result<()> {
+# let jpeg_bytes = vec![];
+ctx.compose()
+    .text("first post with a picture, and the one that inspired it")
+    // Alt text is a required argument — you cannot attach an image without it.
+    .image(jpeg_bytes, "A sunset over the ocean, silhouetting a lone surfer")
+    .quote(&notif)             // image + quote ⇒ a recordWithMedia embed
+    .send()
+    .await?;
+
+// An external link card: the URL is fetched and its OpenGraph title,
+// description, and preview image become the card (thumbnail uploaded for you).
+ctx.compose()
+    .text("worth a read:")
+    .link_card("https://example.com/article")
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+The builder covers:
+
+- `.image(bytes, alt)` (up to four; MIME sniffed) / `.image_with(bytes, alt, mime)`
+- `.video(bytes, alt)` — MP4 via the Bluesky video service
+- `.link_card(url)` — auto-fetch OpenGraph / Twitter-card metadata; or
+  `.external(uri, title, description)` with no fetching
+- `.quote(&notif)` / `.quote_ref(strong_ref)` — quote posts (record embeds)
+- `.reply_to(&notif)`, `.text(..)`, `.langs(..)`
+
+A post carries a single media kind (images **or** video **or** an external card),
+optionally alongside a quote. **Alt text is required by the type signature** for
+images and video — omitting it is a compile error, not a lint. All blobs upload
+to the bot's own PDS, so media works the same on `bsky.social` and on
+third-party / self-hosted PDSes.
 
 ## Real-time streaming (Jetstream)
 

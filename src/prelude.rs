@@ -6,6 +6,6 @@
 
 pub use crate::{
     Bot, BotBuilder, BotConfig, BotIdentity, CommitOp, Context, Dedup, Error, JetstreamConfig,
-    Notification, NotificationReason, RateLimitConfig, Result, Schedule, StreamEvent, StreamKind,
-    Tz,
+    Notification, NotificationReason, PostBuilder, RateLimitConfig, Result, Schedule, StreamEvent,
+    StreamKind, Tz,
 };
