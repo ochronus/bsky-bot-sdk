@@ -10,8 +10,18 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use atrium_api::types::string::Datetime;
+use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
 use crate::event::Notification;
+
+/// The serializable form of a [`Dedup`] watermark, for persisting through a
+/// [`Store`](crate::store::Store) so a restart resumes exactly where it left off.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DedupState {
+    high_water: Option<Datetime>,
+    seen: Vec<String>,
+}
 
 /// Tracks which notifications have already been handled across poll cycles.
 ///
@@ -86,6 +96,25 @@ impl Dedup {
             self.mark(notif);
         }
         fresh
+    }
+
+    /// Serialize the watermark to a compact JSON string, for persisting through a
+    /// [`Store`](crate::store::Store).
+    pub fn to_json(&self) -> Result<String> {
+        let state = DedupState {
+            high_water: self.high_water.clone(),
+            seen: self.seen_at_watermark.iter().cloned().collect(),
+        };
+        Ok(serde_json::to_string(&state)?)
+    }
+
+    /// Reconstruct a watermark previously produced by [`to_json`](Dedup::to_json).
+    pub fn from_json(json: &str) -> Result<Self> {
+        let state: DedupState = serde_json::from_str(json)?;
+        Ok(Self {
+            high_water: state.high_water,
+            seen_at_watermark: state.seen.into_iter().collect(),
+        })
     }
 }
 
@@ -185,6 +214,30 @@ mod tests {
             ["at://x/a", "at://x/b", "at://x/c"],
             "fresh items, oldest first"
         );
+    }
+
+    #[test]
+    fn json_round_trip_preserves_the_watermark_and_tie_set() {
+        let mut dedup = Dedup::new();
+        let ts = "2026-07-22T10:00:00.000Z";
+        dedup.mark(&notif("at://x/a", ts));
+        dedup.mark(&notif("at://x/b", ts)); // a tie at the watermark instant
+
+        let json = dedup.to_json().expect("serialize");
+        let restored = Dedup::from_json(&json).expect("deserialize");
+
+        // Everything already seen must still be seen after a round-trip…
+        assert!(!restored.is_new(&notif("at://x/a", ts)));
+        assert!(!restored.is_new(&notif("at://x/b", ts)));
+        // …and genuinely newer work is still new.
+        assert!(restored.is_new(&notif("at://x/c", "2026-07-22T10:00:01.000Z")));
+        // …while older work stays covered.
+        assert!(!restored.is_new(&notif("at://x/old", "2026-07-22T09:00:00.000Z")));
+    }
+
+    #[test]
+    fn from_json_rejects_malformed_state() {
+        assert!(Dedup::from_json("not json").is_err());
     }
 
     #[test]

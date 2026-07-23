@@ -16,11 +16,31 @@ use crate::event::{Notification, NotificationReason};
 /// A boxed, `Send` future — the erased return type of a handler.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Whether a [`before`](crate::BotBuilder::before) middleware lets a notification
+/// reach the handlers, or drops it.
+///
+/// Returned by middleware registered with [`before`](crate::BotBuilder::before);
+/// the convenience filters ([`block_authors`](crate::BotBuilder::block_authors),
+/// [`allow_authors`](crate::BotBuilder::allow_authors),
+/// [`ignore_self`](crate::BotBuilder::ignore_self)) produce it for you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// Continue to the next middleware, then the handlers.
+    Continue,
+    /// Drop this notification: skip the remaining middleware, every handler, and
+    /// the `after` chain.
+    Skip,
+}
+
 pub(crate) type HandlerFn =
     Arc<dyn Fn(Context, Notification) -> BoxFuture<Result<()>> + Send + Sync>;
 
 pub(crate) type ErrorHandlerFn =
     Arc<dyn Fn(Context, Notification, Error) -> BoxFuture<()> + Send + Sync>;
+
+pub(crate) type MiddlewareFn = Arc<dyn Fn(Context, Notification) -> BoxFuture<Flow> + Send + Sync>;
+
+pub(crate) type AfterFn = Arc<dyn Fn(Context, Notification) -> BoxFuture<()> + Send + Sync>;
 
 /// Erase a concrete async handler closure into a [`HandlerFn`].
 pub(crate) fn boxed_handler<F, Fut>(handler: F) -> HandlerFn
@@ -40,12 +60,36 @@ where
     Arc::new(move |ctx, notif, err| Box::pin(handler(ctx, notif, err)))
 }
 
+/// Erase a concrete async `before` middleware into a [`MiddlewareFn`].
+pub(crate) fn boxed_middleware<F, Fut>(filter: F) -> MiddlewareFn
+where
+    F: Fn(Context, Notification) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Flow> + Send + 'static,
+{
+    Arc::new(move |ctx, notif| Box::pin(filter(ctx, notif)))
+}
+
+/// Erase a concrete async `after` hook into an [`AfterFn`].
+pub(crate) fn boxed_after<F, Fut>(hook: F) -> AfterFn
+where
+    F: Fn(Context, Notification) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move |ctx, notif| Box::pin(hook(ctx, notif)))
+}
+
 /// The registry of handlers for a bot.
 #[derive(Default, Clone)]
 pub(crate) struct Handlers {
     by_reason: HashMap<NotificationReason, Vec<HandlerFn>>,
     any: Vec<HandlerFn>,
     on_error: Option<ErrorHandlerFn>,
+    /// Middleware run (in order) before any handler; a [`Flow::Skip`] drops the
+    /// notification.
+    before: Vec<MiddlewareFn>,
+    /// Hooks run (in order) after all handlers, unless a `before` middleware
+    /// skipped the notification.
+    after: Vec<AfterFn>,
 }
 
 impl Handlers {
@@ -61,17 +105,36 @@ impl Handlers {
         self.on_error = Some(handler);
     }
 
+    pub(crate) fn add_before(&mut self, mw: MiddlewareFn) {
+        self.before.push(mw);
+    }
+
+    pub(crate) fn add_after(&mut self, hook: AfterFn) {
+        self.after.push(hook);
+    }
+
     /// True when no reason-specific and no catch-all handlers are registered.
     pub(crate) fn is_empty(&self) -> bool {
         self.by_reason.is_empty() && self.any.is_empty()
     }
 
-    /// Dispatch a single notification to every handler that applies: first the
-    /// reason-specific ones (in registration order), then the catch-all ones.
+    /// Dispatch a single notification: run the `before` middleware (any
+    /// [`Flow::Skip`] drops it), then every applicable handler — reason-specific
+    /// ones first (in registration order), then the catch-alls — then the `after`
+    /// hooks.
     ///
     /// A handler returning `Err` never aborts the batch; the error is routed to
     /// the registered error handler, or logged if there is none.
     pub(crate) async fn dispatch(&self, ctx: Context, notif: Notification) {
+        // Pre-filters: the first that returns `Skip` drops the notification before
+        // any handler or `after` hook runs.
+        for mw in &self.before {
+            if mw(ctx.clone(), notif.clone()).await == Flow::Skip {
+                tracing::trace!(uri = %notif.uri(), "notification skipped by middleware");
+                return;
+            }
+        }
+
         let reason = notif.reason();
         // Reason-specific handlers first, then catch-alls — without allocating.
         let selected = self
@@ -94,6 +157,10 @@ impl Handlers {
                     ),
                 }
             }
+        }
+
+        for hook in &self.after {
+            hook(ctx.clone(), notif.clone()).await;
         }
     }
 }
@@ -240,5 +307,100 @@ mod tests {
         assert!(handlers.is_empty());
         handlers.register_any(boxed_handler(|_c, _n| async move { Ok(()) }));
         assert!(!handlers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_skip_prevents_handlers_and_after_hooks() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handlers = Handlers::default();
+
+        // A `before` that always skips.
+        handlers.add_before(boxed_middleware(|_c, _n| async move { Flow::Skip }));
+
+        let handler_log = Arc::clone(&log);
+        handlers.register_any(boxed_handler(move |_c, _n| {
+            let log = Arc::clone(&handler_log);
+            async move {
+                log.lock().unwrap().push("handler".into());
+                Ok(())
+            }
+        }));
+        let after_log = Arc::clone(&log);
+        handlers.add_after(boxed_after(move |_c, _n| {
+            let log = Arc::clone(&after_log);
+            async move {
+                log.lock().unwrap().push("after".into());
+            }
+        }));
+
+        let ctx = test_context().await;
+        handlers.dispatch(ctx, notif("mention")).await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a skip must run neither the handler nor the after hook",
+        );
+    }
+
+    #[tokio::test]
+    async fn before_continue_runs_handler_then_after_in_order() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handlers = Handlers::default();
+
+        let before_log = Arc::clone(&log);
+        handlers.add_before(boxed_middleware(move |_c, _n| {
+            let log = Arc::clone(&before_log);
+            async move {
+                log.lock().unwrap().push("before".into());
+                Flow::Continue
+            }
+        }));
+        let handler_log = Arc::clone(&log);
+        handlers.register_any(boxed_handler(move |_c, _n| {
+            let log = Arc::clone(&handler_log);
+            async move {
+                log.lock().unwrap().push("handler".into());
+                Ok(())
+            }
+        }));
+        let after_log = Arc::clone(&log);
+        handlers.add_after(boxed_after(move |_c, _n| {
+            let log = Arc::clone(&after_log);
+            async move {
+                log.lock().unwrap().push("after".into());
+            }
+        }));
+
+        let ctx = test_context().await;
+        handlers.dispatch(ctx, notif("mention")).await;
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &["before", "handler", "after"],
+            "the pipeline runs before → handler → after in order",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_middleware_skip_short_circuits_earlier_continues() {
+        let ran_handler = Arc::new(Mutex::new(false));
+        let mut handlers = Handlers::default();
+
+        handlers.add_before(boxed_middleware(|_c, _n| async move { Flow::Continue }));
+        handlers.add_before(boxed_middleware(|_c, _n| async move { Flow::Skip }));
+
+        let flag = Arc::clone(&ran_handler);
+        handlers.register_any(boxed_handler(move |_c, _n| {
+            let flag = Arc::clone(&flag);
+            async move {
+                *flag.lock().unwrap() = true;
+                Ok(())
+            }
+        }));
+
+        let ctx = test_context().await;
+        handlers.dispatch(ctx, notif("mention")).await;
+        assert!(
+            !*ran_handler.lock().unwrap(),
+            "a Skip from any middleware must stop the pipeline",
+        );
     }
 }

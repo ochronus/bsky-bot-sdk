@@ -11,8 +11,11 @@ It's built on top of atrium's [`bsky-sdk`](https://crates.io/crates/bsky-sdk) an
 adds the glue a bot actually needs: a notification event loop, real-time network
 ingestion via the [Jetstream](https://docs.bsky.app/blog/jetstream) firehose,
 typed events, one-call reply/like/repost/follow helpers with automatic rich-text
-detection, session persistence, client-side rate limiting, interval/cron
-scheduling, and graceful shutdown.
+detection, a command router with middleware, transparently-paginated reads, a
+broad set of write actions (mute/block/unfollow, profile edits, reply/quote
+controls, lists), pluggable persistence, session handling, client-side rate
+limiting, interval/cron scheduling, an in-process test harness, and graceful
+shutdown.
 
 ```rust
 use bsky_bot_sdk::prelude::*;
@@ -49,12 +52,16 @@ still needs the loop around it. This crate provides:
 | **De-duplication** | A watermark tracker (`Dedup`) that survives restarts and breaks timestamp ties, so you never double-reply. |
 | **Typed events** | `NotificationReason::{Mention, Reply, Follow, Like, Repost, Quote, …}` instead of magic strings. |
 | **Actions** | `ctx.reply_to`, `ctx.like`, `ctx.repost`, `ctx.follow_back`, `ctx.post`, `ctx.delete` — threading and facet detection handled for you. |
+| **More write actions** | `unfollow`, `block`/`unblock`, `mute`/`unmute`, profile edits (`update_profile`, `set_display_name`/`set_description`/`set_avatar`), reply controls (`set_reply_gate`, `disable_replies`) and quote controls (`disable_quotes`), and lists (`create_list`, `add_to_list`). |
+| **Reads & pagination** | `ctx.timeline()`, `ctx.followers(..)`, `ctx.following(..)`, `ctx.user_posts(..)` return a `Paginated` async stream that follows the cursor for you — `next()`, `collect_all()`, or `take(n)`. |
+| **Commands & middleware** | `command("weather", ..)` parses `@bot <command> <args>` (and `dm_command` for DMs) into a dispatch table; a `before`/`after` middleware chain with `block_authors`/`allow_authors`/`ignore_self` filters gates every handler. |
 | **Media & embeds** | `ctx.compose()` builds posts with images (**alt text required by type**), video, external link cards (auto-fetched OpenGraph), and quote posts — uploaded to your own PDS, so it works on any server. |
 | **Threads & auto-split** | `ctx.thread()` chains posts into a reply thread and splits long text at word boundaries into 300-grapheme posts, with optional `i/N` numbering. |
 | **Direct messages** | `on_message` reacts to private [`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat) conversations; `ctx.send_dm` / `ctx.send_dm_to_convo` reply. The bot's own messages are filtered out, so an echo cannot loop. |
 | **Automated self-label** | `automated_label(true)` declares the account a bot on its profile (the guideline-recommended `bot` self-label), preserving everything else the profile already has. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
+| **Persistence** | A pluggable `Store` trait (`MemoryStore`, JSON `FileStore`) backs the notification watermark — a restart resumes exactly where it left off — plus an idempotency set (`ctx.remember` / `is_remembered`) and any conversation state you keep. |
 | **Resilience** | Transient failures (network blips, 5xx, throttling) on the poll loops and idempotent reads are retried with jittered backoff (`retry_policy`); the Jetstream stream auto-reconnects. Writes are never blindly retried. |
 | **Rate limiting** | A token bucket models Bluesky's points-based write budget (on by default), *and* the SDK reads the server's `RateLimit-*` headers (`ctx.server_rate_limit()`) and waits when the server says the window is exhausted. |
 | **Scheduling** | Run actions on an interval or a cron schedule (`every`, `cron`) — many at once, alongside the notification loop. |
@@ -157,6 +164,10 @@ cargo run --example media_bot         # reply with images / quotes / link cards
 cargo run --example thread_bot        # reply with an auto-split, numbered thread
 cargo run --example dm_bot            # echo direct messages (chat.bsky.convo)
 cargo run --example self_label_bot    # declare the account automated (bot self-label)
+cargo run --example command_bot       # @bot commands (ping/echo) + middleware filters
+cargo run --example paginated_reads   # followers + timeline as paged streams (read-only)
+cargo run --example moderation_bot    # mute / block / unfollow + profile edits
+cargo run --example persistent_bot    # resume across restarts; greet each person once
 ```
 
 ## Media & embeds
@@ -373,6 +384,94 @@ idempotent and skipped when the profile is already labeled, so it's free on a wa
 restart. For a runtime change, call `ctx.set_automated_label(true | false)`. The
 exact wire value is exposed as `BOT_SELF_LABEL` (`"bot"`).
 
+## Commands & middleware
+
+Register a small command language on mentions (and, with `dm_command`, on DMs).
+The first word after the bot's mention is the command; matching is
+case-insensitive. A `before`/`after` middleware chain wraps every handler — the
+ready-made `ignore_self`, `block_authors`, and `allow_authors` filters cover the
+common cases, and `before` / `filter` handle the rest.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b.ignore_self()                         // never react to our own activity
+    .block_authors(["spammer.example"]) // drop these authors before any handler
+    .command("ping", |ctx, notif, _cmd| async move {
+        ctx.reply_to(&notif, "pong 🏓").await?;
+        Ok(())
+    })
+    .command("echo", |ctx, notif, cmd| async move {
+        ctx.reply_to(&notif, cmd.rest()).await?; // everything after "echo"
+        Ok(())
+    })
+    .default_command(|ctx, notif, cmd| async move {
+        ctx.reply_to(&notif, format!("unknown command: {}", cmd.name())).await?;
+        Ok(())
+    })
+# }
+```
+
+A `before` middleware returns `Flow::Continue` or `Flow::Skip`; a `Skip` drops the
+notification before any handler or `after` hook runs. Add `.command_prefix("!")`
+to require a sigil (`@yourbot !ping`). Commands compose with plain `on_mention`
+handlers, and a command-only bot runs without wiring one. See the
+[`command_bot`](examples/command_bot.rs) example.
+
+## Reads with transparent pagination
+
+The read helpers return a `Paginated` async stream that follows the cursor for you,
+fetching each page lazily as you consume it. Drain a **bounded** list with
+`collect_all()`; cap an **unbounded** feed with `take(n)`.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# async fn demo(ctx: Context) -> Result<()> {
+// Bounded — safe to collect the whole thing.
+let followers = ctx.followers("alice.bsky.social").collect_all().await?;
+println!("{} followers", followers.len());
+
+// Unbounded — always bound it.
+let mut feed = ctx.timeline().take(20);
+while let Some(item) = feed.next().await {
+    let post = item?;
+    println!("@{}", post.post.author.handle.as_str());
+}
+# Ok(())
+# }
+```
+
+`timeline`, `user_posts(actor)`, `followers(actor)`, `following(actor)` (and
+`my_followers` / `my_following`) all page transparently; `Paginated` also
+implements `futures::Stream`. See [`paginated_reads`](examples/paginated_reads.rs).
+
+## Moderation & profile write actions
+
+Beyond posting, the `Context` covers the rest of a bot's write surface:
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# async fn demo(ctx: Context, post_uri: &str) -> Result<()> {
+ctx.mute("troll.example").await?;      // private, one-way, not charged to the budget
+ctx.block("did:plc:…").await?;         // public block record
+ctx.unfollow("ex.example").await?;     // deletes the follow record (returns whether it existed)
+
+// Read-modify-write the profile, preserving untouched fields.
+ctx.update_profile(|p| {
+    p.display_name = Some("My Bot".into());
+    p.description = Some("Beep boop.".into());
+}).await?;
+
+// Limit who may reply to a post the bot made.
+ctx.set_reply_gate(post_uri, [ReplyGate::Following, ReplyGate::Mentioned]).await?;
+# Ok(())
+# }
+```
+
+Also: `unmute`, `unblock`, `set_display_name` / `set_description` / `set_avatar`,
+`disable_replies` / `remove_reply_gate`, `disable_quotes` / `allow_quotes`, and
+`create_list` / `add_to_list`. See [`moderation_bot`](examples/moderation_bot.rs).
+
 ## Scheduling
 
 Besides reacting to notifications, a bot can run **actions on a schedule** — an
@@ -474,6 +573,37 @@ Pass `session_file("session.json")` and the bot writes its session there after
 login and resumes from it on the next start. If the saved session can't be
 resumed (e.g. it expired), the bot falls back to logging in with the configured
 credentials and rewrites the file.
+
+## Persistent state (`Store`)
+
+Attach a `Store` and the bot remembers more than its login. Two backends ship with
+the crate — `MemoryStore` and a JSON-file `FileStore` — and the trait
+(`load`/`save`/`remove`) is small enough to back with SQLite, Redis, or anything
+else.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# use bsky_bot_sdk::FileStore;
+# fn demo(b: BotBuilder) -> Result<BotBuilder> {
+Ok(b.store(FileStore::new("bot-state.json")?)
+    .on_mention(|ctx, notif| async move {
+        let key = format!("greeted:{}", notif.author_did());
+        if ctx.is_remembered(&key).await? {
+            return Ok(()); // greet each account only once, even across restarts
+        }
+        ctx.reply_to(&notif, "👋 nice to meet you!").await?;
+        ctx.remember(&key).await?;
+        Ok(())
+    }))
+# }
+```
+
+With a store configured, the **notification watermark** is persisted, so a restart
+resumes exactly where it left off instead of skipping the startup backlog — no
+missed notifications across downtime. Handlers reach the same store via
+`ctx.store()`, and `remember` / `is_remembered` / `forget` give an idempotency set
+so outbound actions survive a mid-batch restart without repeating. See
+[`persistent_bot`](examples/persistent_bot.rs).
 
 ## Driving the loop yourself
 

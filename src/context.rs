@@ -5,15 +5,25 @@ use std::sync::Arc;
 
 use atrium_api::agent::AtprotoServiceType;
 use atrium_api::agent::bluesky::BSKY_CHAT_DID;
-use atrium_api::app::bsky::actor::profile;
-use atrium_api::app::bsky::feed::{like, post, repost};
-use atrium_api::app::bsky::graph::follow;
+use atrium_api::app::bsky::actor::defs::{ProfileView, ViewerState};
+use atrium_api::app::bsky::actor::{get_profile, profile};
+use atrium_api::app::bsky::feed::defs::FeedViewPost;
+use atrium_api::app::bsky::feed::{
+    get_author_feed, get_timeline, like, post, postgate, repost, threadgate,
+};
+use atrium_api::app::bsky::graph::{
+    block, defs as graph_defs, follow, get_followers, get_follows, list, listitem, mute_actor,
+    unmute_actor,
+};
 use atrium_api::chat::bsky::actor::declaration;
 use atrium_api::chat::bsky::convo::defs::{MessageInput, MessageInputData};
 use atrium_api::chat::bsky::convo::{get_convo_for_members, get_log, send_message};
-use atrium_api::com::atproto::repo::{create_record, delete_record, get_record, strong_ref};
-use atrium_api::types::BlobRef;
-use atrium_api::types::string::{Datetime, Did, Handle, Nsid, RecordKey};
+use atrium_api::com::atproto::repo::{
+    create_record, delete_record, get_record, put_record, strong_ref,
+};
+use atrium_api::types::LimitedNonZeroU8;
+use atrium_api::types::string::{AtIdentifier, Datetime, Did, Handle, Nsid, RecordKey};
+use atrium_api::types::{BlobRef, Union};
 use atrium_api::xrpc::error::XrpcErrorKind;
 use bsky_sdk::BskyAgent;
 use bsky_sdk::record::Record;
@@ -24,8 +34,10 @@ use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::{RateLimitClient, RateLimitStatus, WriteBudget};
+use crate::read::{Page, Paginated, paginate};
 use crate::retry::{RetryPolicy, retry};
 use crate::self_label::{has_bot_label, set_bot_label};
+use crate::store::Store;
 use crate::thread::ThreadBuilder;
 
 /// The DID of the Bluesky chat service, reached via the `atproto-proxy` header.
@@ -77,6 +89,83 @@ fn is_record_not_found(err: &atrium_api::xrpc::Error<get_record::Error>) -> bool
     }
 }
 
+/// Parse a DID string into a typed [`Did`].
+fn parse_did(did: &str) -> Result<Did> {
+    did.parse()
+        .map_err(|_| Error::invalid_input(format!("invalid DID: {did}")))
+}
+
+/// Parse a handle-or-DID string into an [`AtIdentifier`], the form the actor-lookup
+/// endpoints (`getProfile`, `muteActor`, …) accept.
+fn at_identifier(actor: &str) -> Result<AtIdentifier> {
+    actor
+        .parse()
+        .map_err(|_| Error::invalid_input(format!("invalid handle or DID: {actor}")))
+}
+
+/// The per-page fetch size for the paginating read helpers: the API maximum, so a
+/// full list is walked in as few round-trips as possible.
+fn page_limit() -> Option<LimitedNonZeroU8<100>> {
+    LimitedNonZeroU8::<100>::try_from(100).ok()
+}
+
+/// Extract the record key (the final path segment) from an `at://…` URI, e.g.
+/// `3k2a…` from `at://did:plc:x/app.bsky.feed.post/3k2a…`. A thread-gate or
+/// post-gate shares the record key of the post it governs.
+fn rkey_of(at_uri: &str) -> Result<RecordKey> {
+    at_uri
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::invalid_input(format!("no record key in AT-URI: {at_uri}")))?
+        .parse()
+        .map_err(|_| Error::invalid_input(format!("invalid record key in AT-URI: {at_uri}")))
+}
+
+/// Who may reply to a post, expressed as one allow-rule of a thread-gate.
+///
+/// A post with **no** thread-gate is open to everyone; a post whose gate lists
+/// one or more [`ReplyGate`] rules is limited to the union of those audiences; a
+/// gate with an **empty** rule set (see [`Context::disable_replies`]) is closed to
+/// everyone but the author. Pass rules to [`Context::set_reply_gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplyGate {
+    /// Only accounts mentioned in the post may reply.
+    Mentioned,
+    /// Only accounts the post's author follows may reply.
+    Following,
+    /// Only accounts that follow the post's author may reply.
+    Followers,
+    /// Only members of the given list (an `at://…/app.bsky.graph.list/…` URI) may
+    /// reply.
+    List(String),
+}
+
+impl ReplyGate {
+    /// Convert to the atrium thread-gate allow-rule union member.
+    fn to_allow_item(&self) -> Union<threadgate::RecordAllowItem> {
+        use threadgate::{
+            FollowerRuleData, FollowingRuleData, ListRuleData, MentionRuleData, RecordAllowItem,
+        };
+        let item = match self {
+            ReplyGate::Mentioned => {
+                RecordAllowItem::MentionRule(Box::new(MentionRuleData {}.into()))
+            }
+            ReplyGate::Following => {
+                RecordAllowItem::FollowingRule(Box::new(FollowingRuleData {}.into()))
+            }
+            ReplyGate::Followers => {
+                RecordAllowItem::FollowerRule(Box::new(FollowerRuleData {}.into()))
+            }
+            ReplyGate::List(uri) => {
+                RecordAllowItem::ListRule(Box::new(ListRuleData { list: uri.clone() }.into()))
+            }
+        };
+        Union::Refs(item)
+    }
+}
+
 /// The bot's own account identity, resolved at login.
 #[derive(Debug, Clone)]
 pub struct BotIdentity {
@@ -118,6 +207,7 @@ pub struct Context {
     identity: Arc<BotIdentity>,
     budget: WriteBudget,
     retry: RetryPolicy,
+    store: Option<Arc<dyn Store>>,
 }
 
 impl Context {
@@ -131,12 +221,20 @@ impl Context {
             identity,
             budget,
             retry: RetryPolicy::default(),
+            store: None,
         }
     }
 
     /// Override the retry policy applied to this context's idempotent reads.
     pub(crate) fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Attach a persistence backend for the watermark, idempotency set, and any
+    /// handler-owned state.
+    pub(crate) fn with_store(mut self, store: Option<Arc<dyn Store>>) -> Self {
+        self.store = store;
         self
     }
 
@@ -172,6 +270,50 @@ impl Context {
     /// The bot's handle.
     pub fn handle(&self) -> &str {
         self.identity.handle()
+    }
+
+    // --- persistence -------------------------------------------------------
+
+    /// The persistence backend, if one was configured with
+    /// [`BotBuilder::store`](crate::BotBuilder::store).
+    ///
+    /// Use it to keep conversation state or any per-user/per-thread data across
+    /// restarts (`ctx.store()?.save("dialog:{did}", &json).await?`). For the common
+    /// "have I already acted on this?" case, prefer the
+    /// [`remember`](Context::remember) / [`is_remembered`](Context::is_remembered)
+    /// helpers below.
+    pub fn store(&self) -> Option<&Arc<dyn Store>> {
+        self.store.as_ref()
+    }
+
+    /// Record `key` in the idempotency set, so [`is_remembered`](Context::is_remembered)
+    /// returns `true` for it on a later call (surviving restarts if the store is
+    /// persistent). A no-op with no store configured.
+    ///
+    /// Use it to make outbound actions idempotent — remember a notification's URI
+    /// after replying so a restart mid-batch can't double-reply.
+    pub async fn remember(&self, key: impl AsRef<str>) -> Result<()> {
+        if let Some(store) = &self.store {
+            store.save(key.as_ref(), "1").await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `key` was previously [`remember`](Context::remember)ed. Always
+    /// `false` when no store is configured (so the action simply proceeds).
+    pub async fn is_remembered(&self, key: impl AsRef<str>) -> Result<bool> {
+        match &self.store {
+            Some(store) => Ok(store.load(key.as_ref()).await?.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    /// Drop `key` from the idempotency set. A no-op with no store configured.
+    pub async fn forget(&self, key: impl AsRef<str>) -> Result<()> {
+        if let Some(store) = &self.store {
+            store.remove(key.as_ref()).await?;
+        }
+        Ok(())
     }
 
     // --- posting -----------------------------------------------------------
@@ -356,11 +498,7 @@ impl Context {
 
     /// Follow an actor by DID string.
     pub async fn follow(&self, did: impl AsRef<str>) -> Result<create_record::Output> {
-        let did = did.as_ref();
-        let did: Did = did
-            .parse()
-            .map_err(|_| Error::invalid_input(format!("invalid DID: {did}")))?;
-        self.follow_did(did).await
+        self.follow_did(parse_did(did.as_ref())?).await
     }
 
     /// Follow an actor by typed DID.
@@ -371,6 +509,113 @@ impl Context {
         };
         self.budget.charge_create().await;
         Ok(record.create(&self.agent).await?)
+    }
+
+    /// Unfollow an actor (by handle or DID) by deleting the bot's follow record.
+    ///
+    /// Returns `true` if the bot was following the actor and the follow was
+    /// deleted, or `false` if it was not following them (a no-op). The follow
+    /// record's URI is discovered via `getProfile` (`viewer.following`).
+    pub async fn unfollow(&self, actor: impl AsRef<str>) -> Result<bool> {
+        match self
+            .viewer_for(actor.as_ref())
+            .await?
+            .and_then(|v| v.data.following)
+        {
+            Some(uri) => {
+                self.delete(uri).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    // --- moderation --------------------------------------------------------
+
+    /// Mute an actor (by handle or DID).
+    ///
+    /// Muting is a private, server-side preference: the muted account is never
+    /// notified, and — unlike a block — no public record is written, so this is
+    /// **not** charged against the client-side write budget.
+    pub async fn mute(&self, actor: impl AsRef<str>) -> Result<()> {
+        let actor = at_identifier(actor.as_ref())?;
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .mute_actor(mute_actor::InputData { actor }.into())
+            .await?;
+        Ok(())
+    }
+
+    /// Remove a mute previously set with [`mute`](Context::mute).
+    pub async fn unmute(&self, actor: impl AsRef<str>) -> Result<()> {
+        let actor = at_identifier(actor.as_ref())?;
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .unmute_actor(unmute_actor::InputData { actor }.into())
+            .await?;
+        Ok(())
+    }
+
+    /// Block an actor by DID.
+    ///
+    /// Unlike a mute, a block is a public `app.bsky.graph.block` record (and is
+    /// charged as a create). Use [`unblock`](Context::unblock) to lift it.
+    pub async fn block(&self, did: impl AsRef<str>) -> Result<create_record::Output> {
+        let record = block::RecordData {
+            created_at: Datetime::now(),
+            subject: parse_did(did.as_ref())?,
+        };
+        self.budget.charge_create().await;
+        Ok(record.create(&self.agent).await?)
+    }
+
+    /// Unblock an actor (by handle or DID) by deleting the bot's block record.
+    ///
+    /// Returns `true` if a block existed and was removed, `false` otherwise. The
+    /// block record's URI is discovered via `getProfile` (`viewer.blocking`).
+    pub async fn unblock(&self, actor: impl AsRef<str>) -> Result<bool> {
+        match self
+            .viewer_for(actor.as_ref())
+            .await?
+            .and_then(|v| v.data.blocking)
+        {
+            Some(uri) => {
+                self.delete(uri).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Fetch an actor's viewer-relationship state (the bot's follow/block/mute
+    /// relationship to them), or `None` if the profile carries no viewer state.
+    ///
+    /// A read, so transient failures are retried per the configured retry policy.
+    async fn viewer_for(&self, actor: &str) -> Result<Option<ViewerState>> {
+        let ident = at_identifier(actor)?;
+        retry(&self.retry, || async {
+            let out = self
+                .agent
+                .api
+                .app
+                .bsky
+                .actor
+                .get_profile(
+                    get_profile::ParametersData {
+                        actor: ident.clone(),
+                    }
+                    .into(),
+                )
+                .await?;
+            Ok(out.data.viewer)
+        })
+        .await
     }
 
     // --- deletion ----------------------------------------------------------
@@ -555,6 +800,374 @@ impl Context {
         Ok(())
     }
 
+    // --- profile edits -----------------------------------------------------
+
+    /// Read-modify-write the bot's own `app.bsky.actor.profile` record.
+    ///
+    /// Fetches the current profile (or an empty one for a brand-new account),
+    /// hands it to `mutate` to change in place, and writes it back — **preserving**
+    /// every field `mutate` leaves untouched (display name, avatar, self-labels,
+    /// …). This is the primitive behind [`set_display_name`](Context::set_display_name),
+    /// [`set_description`](Context::set_description), and
+    /// [`set_avatar`](Context::set_avatar); reach for it directly to change several
+    /// fields in one write, or to touch a field without a dedicated helper.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.update_profile(|p| {
+    ///     p.display_name = Some("My Bot".into());
+    ///     p.description = Some("Beep boop.".into());
+    /// })
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_profile<F>(&self, mutate: F) -> Result<()>
+    where
+        F: FnOnce(&mut profile::RecordData),
+    {
+        let mut record = self
+            .fetch_profile_record()
+            .await?
+            .unwrap_or_else(empty_profile);
+        mutate(&mut record);
+        self.budget.charge_create().await;
+        record.put(&self.agent, profile_rkey()?).await?;
+        Ok(())
+    }
+
+    /// Set the bot's profile display name, preserving the rest of the profile.
+    pub async fn set_display_name(&self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        self.update_profile(move |p| p.display_name = Some(name))
+            .await
+    }
+
+    /// Set the bot's profile description (bio), preserving the rest of the profile.
+    pub async fn set_description(&self, description: impl Into<String>) -> Result<()> {
+        let description = description.into();
+        self.update_profile(move |p| p.description = Some(description))
+            .await
+    }
+
+    /// Set the bot's profile avatar from raw image bytes, preserving the rest of
+    /// the profile. The bytes are uploaded as a blob to the bot's own PDS first.
+    pub async fn set_avatar(&self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        let blob = self.upload_blob(bytes).await?;
+        self.update_profile(move |p| p.avatar = Some(blob)).await
+    }
+
+    // --- reply & quote controls -------------------------------------------
+
+    /// Limit who may reply to one of the bot's posts, by writing an
+    /// `app.bsky.feed.threadgate` for it.
+    ///
+    /// `post_uri` must be an `at://…/app.bsky.feed.post/…` URI of a post the bot
+    /// authored. Each [`ReplyGate`] rule widens the allowed audience (the union of
+    /// all rules may reply); passing **no** rules closes the thread to everyone but
+    /// the bot — the same as [`disable_replies`](Context::disable_replies). Writing
+    /// the gate is idempotent (it shares the post's record key), so calling it again
+    /// replaces the previous rules.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context, post_uri: &str) -> Result<()> {
+    /// // Only people the bot follows, or people it @-mentioned, may reply.
+    /// ctx.set_reply_gate(post_uri, [ReplyGate::Following, ReplyGate::Mentioned])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_reply_gate(
+        &self,
+        post_uri: impl AsRef<str>,
+        rules: impl IntoIterator<Item = ReplyGate>,
+    ) -> Result<put_record::Output> {
+        let post_uri = post_uri.as_ref();
+        let rkey = rkey_of(post_uri)?;
+        let allow: Vec<Union<threadgate::RecordAllowItem>> =
+            rules.into_iter().map(|r| r.to_allow_item()).collect();
+        let record = threadgate::RecordData {
+            allow: Some(allow),
+            created_at: Datetime::now(),
+            hidden_replies: None,
+            post: post_uri.to_string(),
+        };
+        self.budget.charge_create().await;
+        Ok(record.put(&self.agent, rkey).await?)
+    }
+
+    /// Close replies on one of the bot's posts entirely (no one but the bot may
+    /// reply). Shorthand for [`set_reply_gate`](Context::set_reply_gate) with no
+    /// rules.
+    pub async fn disable_replies(&self, post_uri: impl AsRef<str>) -> Result<put_record::Output> {
+        self.set_reply_gate(post_uri, []).await
+    }
+
+    /// Remove the thread-gate from one of the bot's posts, re-opening replies to
+    /// everyone. Returns the delete output; deleting an absent gate is a no-op on
+    /// the server.
+    pub async fn remove_reply_gate(
+        &self,
+        post_uri: impl AsRef<str>,
+    ) -> Result<delete_record::Output> {
+        let rkey = rkey_of(post_uri.as_ref())?;
+        let uri = format!(
+            "at://{}/app.bsky.feed.threadgate/{}",
+            self.did(),
+            rkey.as_str()
+        );
+        self.delete(uri).await
+    }
+
+    /// Disable quote-posts of one of the bot's posts, by writing an
+    /// `app.bsky.feed.postgate` that turns off embedding. Existing quotes are
+    /// detached. Use [`allow_quotes`](Context::allow_quotes) to re-enable.
+    pub async fn disable_quotes(&self, post_uri: impl AsRef<str>) -> Result<put_record::Output> {
+        let post_uri = post_uri.as_ref();
+        let rkey = rkey_of(post_uri)?;
+        let disable = Union::Refs(postgate::RecordEmbeddingRulesItem::DisableRule(Box::new(
+            postgate::DisableRuleData {}.into(),
+        )));
+        let record = postgate::RecordData {
+            created_at: Datetime::now(),
+            detached_embedding_uris: None,
+            embedding_rules: Some(vec![disable]),
+            post: post_uri.to_string(),
+        };
+        self.budget.charge_create().await;
+        Ok(record.put(&self.agent, rkey).await?)
+    }
+
+    /// Re-enable quote-posts of one of the bot's posts by removing its post-gate.
+    pub async fn allow_quotes(&self, post_uri: impl AsRef<str>) -> Result<delete_record::Output> {
+        let rkey = rkey_of(post_uri.as_ref())?;
+        let uri = format!(
+            "at://{}/app.bsky.feed.postgate/{}",
+            self.did(),
+            rkey.as_str()
+        );
+        self.delete(uri).await
+    }
+
+    // --- lists -------------------------------------------------------------
+
+    /// Create a curation list and return its `createRecord` output (whose `uri` is
+    /// the list's AT-URI, for [`add_to_list`](Context::add_to_list)).
+    pub async fn create_list(
+        &self,
+        name: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<create_record::Output> {
+        let record = list::RecordData {
+            avatar: None,
+            created_at: Datetime::now(),
+            description,
+            description_facets: None,
+            labels: None,
+            name: name.into(),
+            purpose: graph_defs::CURATELIST.to_string(),
+        };
+        self.budget.charge_create().await;
+        Ok(record.create(&self.agent).await?)
+    }
+
+    /// Add an actor (by DID) to one of the bot's lists (by list AT-URI).
+    pub async fn add_to_list(
+        &self,
+        list_uri: impl Into<String>,
+        did: impl AsRef<str>,
+    ) -> Result<create_record::Output> {
+        let record = listitem::RecordData {
+            created_at: Datetime::now(),
+            list: list_uri.into(),
+            subject: parse_did(did.as_ref())?,
+        };
+        self.budget.charge_create().await;
+        Ok(record.create(&self.agent).await?)
+    }
+
+    // --- reads (transparently paginated) -----------------------------------
+
+    /// Stream the bot's home timeline, newest first.
+    ///
+    /// Returns a [`Paginated`] stream that fetches each page lazily as you consume
+    /// it. The timeline is effectively unbounded, so cap it with
+    /// [`Paginated::take`] rather than [`Paginated::collect_all`].
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// let mut feed = ctx.timeline().take(50);
+    /// while let Some(item) = feed.next().await {
+    ///     let post = item?;
+    ///     println!("{}: {:?}", post.post.author.handle.as_str(), post.post.cid);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn timeline(&self) -> Paginated<FeedViewPost> {
+        let ctx = self.clone();
+        paginate(move |cursor| {
+            let ctx = ctx.clone();
+            async move {
+                retry(&ctx.retry, || async {
+                    let out = ctx
+                        .agent
+                        .api
+                        .app
+                        .bsky
+                        .feed
+                        .get_timeline(
+                            get_timeline::ParametersData {
+                                algorithm: None,
+                                cursor: cursor.clone(),
+                                limit: page_limit(),
+                            }
+                            .into(),
+                        )
+                        .await?;
+                    Ok(Page {
+                        items: out.data.feed,
+                        cursor: out.data.cursor,
+                    })
+                })
+                .await
+            }
+        })
+    }
+
+    /// Stream an actor's posts (their author feed), newest first, by handle or DID.
+    ///
+    /// Like [`timeline`](Context::timeline), an author feed can be long; bound it
+    /// with [`Paginated::take`].
+    pub fn user_posts(&self, actor: impl AsRef<str>) -> Paginated<FeedViewPost> {
+        let actor = match at_identifier(actor.as_ref()) {
+            Ok(actor) => actor,
+            Err(err) => return Paginated::once_err(err),
+        };
+        let ctx = self.clone();
+        paginate(move |cursor| {
+            let ctx = ctx.clone();
+            let actor = actor.clone();
+            async move {
+                retry(&ctx.retry, || async {
+                    let out = ctx
+                        .agent
+                        .api
+                        .app
+                        .bsky
+                        .feed
+                        .get_author_feed(
+                            get_author_feed::ParametersData {
+                                actor: actor.clone(),
+                                cursor: cursor.clone(),
+                                filter: None,
+                                include_pins: None,
+                                limit: page_limit(),
+                            }
+                            .into(),
+                        )
+                        .await?;
+                    Ok(Page {
+                        items: out.data.feed,
+                        cursor: out.data.cursor,
+                    })
+                })
+                .await
+            }
+        })
+    }
+
+    /// Stream the accounts that follow an actor (by handle or DID). Bounded, so
+    /// [`Paginated::collect_all`] is safe.
+    pub fn followers(&self, actor: impl AsRef<str>) -> Paginated<ProfileView> {
+        let actor = match at_identifier(actor.as_ref()) {
+            Ok(actor) => actor,
+            Err(err) => return Paginated::once_err(err),
+        };
+        let ctx = self.clone();
+        paginate(move |cursor| {
+            let ctx = ctx.clone();
+            let actor = actor.clone();
+            async move {
+                retry(&ctx.retry, || async {
+                    let out = ctx
+                        .agent
+                        .api
+                        .app
+                        .bsky
+                        .graph
+                        .get_followers(
+                            get_followers::ParametersData {
+                                actor: actor.clone(),
+                                cursor: cursor.clone(),
+                                limit: page_limit(),
+                            }
+                            .into(),
+                        )
+                        .await?;
+                    Ok(Page {
+                        items: out.data.followers,
+                        cursor: out.data.cursor,
+                    })
+                })
+                .await
+            }
+        })
+    }
+
+    /// Stream the accounts an actor follows (by handle or DID). Bounded, so
+    /// [`Paginated::collect_all`] is safe.
+    pub fn following(&self, actor: impl AsRef<str>) -> Paginated<ProfileView> {
+        let actor = match at_identifier(actor.as_ref()) {
+            Ok(actor) => actor,
+            Err(err) => return Paginated::once_err(err),
+        };
+        let ctx = self.clone();
+        paginate(move |cursor| {
+            let ctx = ctx.clone();
+            let actor = actor.clone();
+            async move {
+                retry(&ctx.retry, || async {
+                    let out = ctx
+                        .agent
+                        .api
+                        .app
+                        .bsky
+                        .graph
+                        .get_follows(
+                            get_follows::ParametersData {
+                                actor: actor.clone(),
+                                cursor: cursor.clone(),
+                                limit: page_limit(),
+                            }
+                            .into(),
+                        )
+                        .await?;
+                    Ok(Page {
+                        items: out.data.follows,
+                        cursor: out.data.cursor,
+                    })
+                })
+                .await
+            }
+        })
+    }
+
+    /// Stream the bot's own followers. Shorthand for [`followers`](Context::followers)
+    /// of the bot itself.
+    pub fn my_followers(&self) -> Paginated<ProfileView> {
+        self.followers(self.did())
+    }
+
+    /// Stream the accounts the bot itself follows. Shorthand for
+    /// [`following`](Context::following) of the bot itself.
+    pub fn my_following(&self) -> Paginated<ProfileView> {
+        self.following(self.did())
+    }
+
     /// Fetch the account's own `app.bsky.actor.profile` record, or `None` if it
     /// has none yet. A missing record is distinguished from other errors so a
     /// transport/auth failure never masquerades as "no profile" (which would risk
@@ -668,5 +1281,119 @@ mod tests {
         // A response with no structured error body is likewise not not-found.
         let bare = xrpc_400(None);
         assert!(!is_record_not_found(&bare));
+    }
+
+    #[test]
+    fn rkey_of_extracts_the_final_path_segment() {
+        let rkey = rkey_of("at://did:plc:alice000000000000000000/app.bsky.feed.post/3kabc123xyz")
+            .expect("valid at-uri");
+        assert_eq!(rkey.as_str(), "3kabc123xyz");
+    }
+
+    #[test]
+    fn rkey_of_rejects_a_uri_with_no_record_key() {
+        // Trailing slash → empty final segment.
+        assert!(rkey_of("at://did:plc:x/app.bsky.feed.post/").is_err());
+        // An outright empty string has no key either.
+        assert!(rkey_of("").is_err());
+        // A segment containing a space is not a valid record key.
+        assert!(rkey_of("at://did:plc:x/coll/has space").is_err());
+    }
+
+    #[test]
+    fn parse_did_accepts_dids_and_rejects_handles() {
+        assert!(parse_did("did:plc:alice000000000000000000").is_ok());
+        // A handle is a valid actor identifier but not a DID.
+        assert!(parse_did("alice.test").is_err());
+        assert!(parse_did("").is_err());
+    }
+
+    #[test]
+    fn at_identifier_accepts_both_handles_and_dids() {
+        assert!(at_identifier("alice.test").is_ok());
+        assert!(at_identifier("did:plc:alice000000000000000000").is_ok());
+        // Whitespace is never a valid identifier.
+        assert!(at_identifier("not valid").is_err());
+    }
+
+    async fn store_context(store: Option<Arc<dyn Store>>) -> Context {
+        let agent = crate::ratelimit::test_agent().await;
+        let identity = Arc::new(BotIdentity::new(
+            "did:plc:bot00000000000000000000000"
+                .parse()
+                .expect("valid did"),
+            "bot.test".parse().expect("valid handle"),
+        ));
+        Context::new(agent, identity, crate::ratelimit::WriteBudget::new(None)).with_store(store)
+    }
+
+    #[tokio::test]
+    async fn remember_is_remembered_and_forget_use_the_store() {
+        let store = crate::store::MemoryStore::new();
+        let ctx = store_context(Some(Arc::new(store.clone()))).await;
+
+        assert!(
+            !ctx.is_remembered("at://x/1").await.unwrap(),
+            "a fresh key is not remembered"
+        );
+        ctx.remember("at://x/1").await.unwrap();
+        assert!(
+            ctx.is_remembered("at://x/1").await.unwrap(),
+            "after remember, the key is remembered"
+        );
+        assert_eq!(store.len(), 1, "the write reached the store");
+
+        ctx.forget("at://x/1").await.unwrap();
+        assert!(
+            !ctx.is_remembered("at://x/1").await.unwrap(),
+            "after forget, the key is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_helpers_are_noops_without_a_store() {
+        let ctx = store_context(None).await;
+        // remember/forget must not error, and is_remembered is always false.
+        ctx.remember("k").await.unwrap();
+        assert!(
+            !ctx.is_remembered("k").await.unwrap(),
+            "with no store, nothing is ever remembered (so the action just proceeds)",
+        );
+        ctx.forget("k").await.unwrap();
+        assert!(ctx.store().is_none(), "no store was configured");
+    }
+
+    #[test]
+    fn reply_gate_maps_each_rule_to_its_lexicon_type() {
+        let cases = [
+            (ReplyGate::Mentioned, "app.bsky.feed.threadgate#mentionRule"),
+            (
+                ReplyGate::Following,
+                "app.bsky.feed.threadgate#followingRule",
+            ),
+            (
+                ReplyGate::Followers,
+                "app.bsky.feed.threadgate#followerRule",
+            ),
+        ];
+        for (gate, expected_type) in cases {
+            let value = serde_json::to_value(gate.to_allow_item()).expect("serialize allow item");
+            assert_eq!(
+                value.get("$type").and_then(|v| v.as_str()),
+                Some(expected_type),
+            );
+        }
+
+        // The list rule additionally carries the list URI.
+        let list = ReplyGate::List("at://did:plc:x/app.bsky.graph.list/abc".into());
+        let value = serde_json::to_value(list.to_allow_item()).expect("serialize list rule");
+        assert_eq!(
+            value.get("$type").and_then(|v| v.as_str()),
+            Some("app.bsky.feed.threadgate#listRule"),
+        );
+        assert_eq!(
+            value.get("list").and_then(|v| v.as_str()),
+            Some("at://did:plc:x/app.bsky.graph.list/abc"),
+        );
     }
 }

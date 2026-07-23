@@ -5,8 +5,8 @@
 //! ```
 
 pub use crate::{
-    BOT_SELF_LABEL, Bot, BotBuilder, BotConfig, BotIdentity, CommitOp, Context, Dedup,
-    DirectMessage, DmAccess, DmConfig, Error, JetstreamConfig, MAX_POST_GRAPHEMES, Notification,
-    NotificationReason, PostBuilder, RateLimitConfig, RateLimitStatus, Result, RetryPolicy,
-    Schedule, StreamEvent, StreamKind, ThreadBuilder, Tz,
+    BOT_SELF_LABEL, Bot, BotBuilder, BotConfig, BotIdentity, Command, CommitOp, Context, Dedup,
+    DirectMessage, DmAccess, DmConfig, Error, Flow, JetstreamConfig, MAX_POST_GRAPHEMES,
+    Notification, NotificationReason, Paginated, PostBuilder, RateLimitConfig, RateLimitStatus,
+    ReplyGate, Result, RetryPolicy, Schedule, Store, StreamEvent, StreamKind, ThreadBuilder, Tz,
 };

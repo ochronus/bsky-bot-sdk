@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-23
+
+First stable release. Completes the framework-maturity tier of the roadmap: the
+reactive/real-time surface, content creation, resilience, and a test harness were
+already in place, and this release adds the last four framework pieces — a command
+router with middleware, transparently-paginated reads, a broad set of write
+actions, and a pluggable storage trait.
+
+### Added
+
+- **Command router + middleware (Tier-2 #6).** Turn `@yourbot <command> <args>`
+  into a dispatch table.
+  - `BotBuilder::command(name, handler)` registers a handler receiving a parsed
+    [`Command`] (`name` / `args` / `arg(i)` / `rest`); matching is
+    case-insensitive. `command_prefix("!")` requires a sigil; `default_command`
+    catches unrecognized commands. `dm_command` / `dm_command_prefix` /
+    `dm_default_command` do the same over direct messages.
+  - A **middleware chain** runs around handler dispatch: `before` (returning
+    `Flow::Continue` / `Flow::Skip`), `after`, the `filter(pred)` convenience, and
+    ready-made filters `block_authors`, `allow_authors`, and `ignore_self`. A
+    `Skip` drops the notification before any handler or `after` hook.
+  - Commands compose with plain `on_mention` / `on_message` handlers; a
+    command-only bot runs without wiring either.
+- **Paginated reads (Tier-2 #8).** `ctx.timeline()`, `ctx.user_posts(actor)`,
+  `ctx.followers(actor)`, `ctx.following(actor)` (plus `my_followers` /
+  `my_following`) return a [`Paginated`] async stream that follows the cursor
+  transparently, fetching each page as you consume it. Drive it with `next()` in a
+  `while let`, drain a bounded list with `collect_all()`, or cap an unbounded feed
+  with `take(n)`; it also implements `futures::Stream`.
+- **More write actions (Tier-2 #9).**
+  - Graph: `unfollow`, `block` / `unblock`, `mute` / `unmute` (mutes are private
+    and not charged to the write budget).
+  - Profile: `update_profile(|p| …)` read-modify-write (preserves untouched
+    fields), plus `set_display_name`, `set_description`, `set_avatar`.
+  - Reply & quote controls: `set_reply_gate(uri, [ReplyGate::…])`,
+    `disable_replies`, `remove_reply_gate` (thread-gates), and `disable_quotes` /
+    `allow_quotes` (post-gates).
+  - Lists: `create_list` and `add_to_list`.
+  - Post `langs` were already available via `ctx.compose()` and `ctx.thread()`.
+- **Pluggable storage (Tier-2 #10).** A small async [`Store`] trait
+  (`load`/`save`/`remove`) with two backends: `MemoryStore` and a JSON-file
+  `FileStore`. Attach one with `BotBuilder::store(..)`:
+  - The **notification watermark** is persisted, so a restart resumes exactly
+    where it left off instead of re-skipping the startup backlog — no missed
+    notifications across downtime.
+  - Handlers reach the store via `ctx.store()`, plus `remember` / `is_remembered`
+    / `forget` for an idempotency set (make outbound actions safe against a
+    mid-batch restart) and any conversation state you keep.
+- **Test harness** additions: `MockBot` now serves `getProfile` and the paginated
+  read endpoints (`set_profile_view`, `set_read_response`), records request query
+  strings (`RecordedRequest::query` / `has_query`), and canned-responds to the new
+  write endpoints — so commands, middleware, reads, and the new write actions are
+  all unit-testable offline.
+- Four new examples: `command_bot`, `paginated_reads`, `moderation_bot`, and
+  `persistent_bot`.
+
+[`Command`]: https://docs.rs/bsky-bot-sdk/latest/bsky_bot_sdk/struct.Command.html
+[`Paginated`]: https://docs.rs/bsky-bot-sdk/latest/bsky_bot_sdk/struct.Paginated.html
+[`Store`]: https://docs.rs/bsky-bot-sdk/latest/bsky_bot_sdk/store/trait.Store.html
+
 ## [0.10.0] - 2026-07-23
 
 ### Added

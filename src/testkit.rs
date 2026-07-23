@@ -81,6 +81,9 @@ pub struct RecordedRequest {
     pub method: String,
     /// The raw request body (JSON for writes; empty for reads).
     pub body: Vec<u8>,
+    /// The URL query string, if any. Reads (`GET`) carry their parameters here,
+    /// e.g. `actor=alice.test&limit=100`.
+    pub query: Option<String>,
 }
 
 impl RecordedRequest {
@@ -106,6 +109,14 @@ impl RecordedRequest {
         }
         self.record()?.get("text")?.as_str().map(str::to_string)
     }
+
+    /// Whether the request's query string contains `key=value` (a read parameter).
+    pub fn has_query(&self, key: &str, value: &str) -> bool {
+        let needle = format!("{key}={value}");
+        self.query
+            .as_deref()
+            .is_some_and(|q| q.split('&').any(|pair| pair == needle))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +129,12 @@ pub(crate) struct MockTransport {
     records: Mutex<Vec<RecordedRequest>>,
     /// The `value` returned by `getRecord`; `None` responds `RecordNotFound`.
     get_record: Mutex<Option<Value>>,
+    /// The `ProfileViewDetailed` returned by `getProfile`; `None` responds with a
+    /// minimal profile carrying no viewer relationship.
+    profile_view: Mutex<Option<Value>>,
+    /// Canned full responses for read endpoints, keyed by NSID. A read endpoint
+    /// without an entry returns an empty (but well-formed) page.
+    read_responses: Mutex<std::collections::HashMap<String, Value>>,
 }
 
 impl MockTransport {
@@ -125,11 +142,32 @@ impl MockTransport {
         Self {
             records: Mutex::new(Vec::new()),
             get_record: Mutex::new(None),
+            profile_view: Mutex::new(None),
+            read_responses: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     fn set_get_record(&self, value: Option<Value>) {
         *self.get_record.lock().expect("mock lock") = value;
+    }
+
+    fn set_profile_view(&self, value: Option<Value>) {
+        *self.profile_view.lock().expect("mock lock") = value;
+    }
+
+    fn set_read_response(&self, nsid: &str, value: Value) {
+        self.read_responses
+            .lock()
+            .expect("mock lock")
+            .insert(nsid.to_string(), value);
+    }
+
+    fn read_response(&self, nsid: &str) -> Option<Value> {
+        self.read_responses
+            .lock()
+            .expect("mock lock")
+            .get(nsid)
+            .cloned()
     }
 
     fn records(&self) -> Vec<RecordedRequest> {
@@ -140,6 +178,7 @@ impl MockTransport {
     pub(crate) fn respond(&self, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
         let method = request.method().to_string();
         let path = request.uri().path().to_string();
+        let query = request.uri().query().map(str::to_string);
         let nsid = path.strip_prefix("/xrpc/").unwrap_or(&path).to_string();
         self.records
             .lock()
@@ -148,6 +187,7 @@ impl MockTransport {
                 nsid: nsid.clone(),
                 method,
                 body: request.body().clone(),
+                query,
             });
 
         match nsid.as_str() {
@@ -183,6 +223,29 @@ impl MockTransport {
                     None => err(400, "RecordNotFound", "mock: no such record"),
                 }
             }
+            // Procedures whose lexicon output is unit (`()`): atrium maps these
+            // from a *non-JSON* (bytes) response, so an empty body — not `{}` — is
+            // what a real server returns and what decodes to `Ok(())`.
+            "app.bsky.graph.muteActor" | "app.bsky.graph.unmuteActor" => ok_empty(),
+            "app.bsky.actor.getProfile" => {
+                match self.profile_view.lock().expect("mock lock").clone() {
+                    Some(value) => ok(value),
+                    // A minimal, valid `ProfileViewDetailed` with no viewer state,
+                    // so `unfollow` / `unblock` see "no relationship".
+                    None => ok(json!({ "did": MOCK_DID, "handle": MOCK_HANDLE })),
+                }
+            }
+            // Paginating reads (roadmap #8). Default to a well-formed empty page so
+            // a stream terminates cleanly; override with `set_read_response`.
+            "app.bsky.feed.getTimeline" | "app.bsky.feed.getAuthorFeed" => ok(self
+                .read_response(&nsid)
+                .unwrap_or_else(|| json!({ "feed": [] }))),
+            "app.bsky.graph.getFollowers" => ok(self
+                .read_response(&nsid)
+                .unwrap_or_else(|| json!({ "followers": [], "subject": minimal_profile() }))),
+            "app.bsky.graph.getFollows" => ok(self
+                .read_response(&nsid)
+                .unwrap_or_else(|| json!({ "follows": [], "subject": minimal_profile() }))),
             "chat.bsky.convo.sendMessage" => ok(message_view(MOCK_DID, "mock")),
             "chat.bsky.convo.getLog" => ok(json!({ "logs": [] })),
             // A catch-all empty object. Typed reads may not decode from this, but
@@ -201,6 +264,15 @@ fn ok(value: Value) -> Response<Vec<u8>> {
         .expect("build mock response")
 }
 
+/// A 200 response with an empty, non-JSON body — the shape atrium decodes into a
+/// unit (`()`) output (e.g. `muteActor`).
+fn ok_empty() -> Response<Vec<u8>> {
+    Response::builder()
+        .status(200)
+        .body(Vec::new())
+        .expect("build empty mock response")
+}
+
 /// A non-2xx response carrying a standard XRPC error body.
 fn err(status: u16, error: &str, message: &str) -> Response<Vec<u8>> {
     Response::builder()
@@ -211,6 +283,11 @@ fn err(status: u16, error: &str, message: &str) -> Response<Vec<u8>> {
                 .expect("serialize mock error"),
         )
         .expect("build mock error response")
+}
+
+/// A minimal, valid `app.bsky.actor.defs#profileView` (just the required fields).
+fn minimal_profile() -> Value {
+    json!({ "did": MOCK_DID, "handle": MOCK_HANDLE })
 }
 
 /// A `chat.bsky.convo.defs#messageView` JSON value.
@@ -277,6 +354,24 @@ impl MockBot {
     /// read-modify-write helpers.
     pub fn set_profile_record(&self, value: Value) {
         self.transport.set_get_record(Some(value));
+    }
+
+    /// Set the `ProfileViewDetailed` that `getProfile` returns. Use this to give a
+    /// fixture a viewer relationship (e.g. `viewer.following` / `viewer.blocking`)
+    /// so [`unfollow`](Context::unfollow) / [`unblock`](Context::unblock) find a
+    /// record to delete. By default `getProfile` returns a bare profile with no
+    /// viewer state (so those helpers report "no relationship").
+    pub fn set_profile_view(&self, value: Value) {
+        self.transport.set_profile_view(Some(value));
+    }
+
+    /// Set the full response a paginating read endpoint returns, by NSID (e.g.
+    /// `app.bsky.graph.getFollowers` → `{ "followers": [...], "cursor": ... }`).
+    /// Without an override, read endpoints return an empty page so streams end
+    /// immediately. Used to exercise [`followers`](Context::followers),
+    /// [`timeline`](Context::timeline), and the other paginated reads.
+    pub fn set_read_response(&self, nsid: &str, value: Value) {
+        self.transport.set_read_response(nsid, value);
     }
 
     // --- assertions --------------------------------------------------------
@@ -506,5 +601,264 @@ mod tests {
         let bot = MockBot::new().await;
         let event = bot.stream_post("did:plc:author0000000000000000000", "rust is great");
         assert_eq!(event.text().as_deref(), Some("rust is great"));
+    }
+
+    // --- write-action wire shapes (roadmap #9) -----------------------------
+
+    /// Every `putRecord` request the bot made, as parsed JSON bodies.
+    fn puts(bot: &MockBot) -> Vec<Value> {
+        bot.requests()
+            .into_iter()
+            .filter(|r| r.nsid == "com.atproto.repo.putRecord")
+            .filter_map(|r| r.json())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn block_creates_a_public_block_record() {
+        let bot = MockBot::new().await;
+        let did = "did:plc:troll000000000000000000000";
+        bot.context().block(did).await.expect("block ok");
+
+        let blocks = bot.created_in("app.bsky.graph.block");
+        assert_eq!(blocks.len(), 1, "exactly one block record");
+        assert_eq!(blocks[0].get("subject").and_then(Value::as_str), Some(did));
+    }
+
+    #[tokio::test]
+    async fn mute_calls_the_procedure_and_writes_no_record() {
+        let bot = MockBot::new().await;
+        bot.context().mute("alice.test").await.expect("mute ok");
+
+        let mutes: Vec<_> = bot
+            .requests()
+            .into_iter()
+            .filter(|r| r.nsid == "app.bsky.graph.muteActor")
+            .collect();
+        assert_eq!(mutes.len(), 1, "one muteActor procedure call");
+        assert_eq!(
+            mutes[0].json().unwrap()["actor"].as_str(),
+            Some("alice.test")
+        );
+        assert!(
+            bot.created().is_empty(),
+            "a mute is a preference, not a repo record"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfollow_deletes_the_follow_record_when_following() {
+        let bot = MockBot::new().await;
+        let follow_uri = format!("at://{}/app.bsky.graph.follow/abc", bot.context().did());
+        bot.set_profile_view(json!({
+            "did": "did:plc:friend0000000000000000000",
+            "handle": "friend.test",
+            "viewer": { "following": follow_uri },
+        }));
+
+        let removed = bot.context().unfollow("friend.test").await.expect("ok");
+        assert!(removed, "an existing follow should be reported removed");
+
+        let deletes: Vec<_> = bot
+            .requests()
+            .into_iter()
+            .filter(|r| r.nsid == "com.atproto.repo.deleteRecord")
+            .collect();
+        assert_eq!(deletes.len(), 1, "the follow record is deleted");
+        assert_eq!(
+            deletes[0].json().unwrap()["collection"].as_str(),
+            Some("app.bsky.graph.follow"),
+        );
+    }
+
+    #[tokio::test]
+    async fn unfollow_is_a_noop_when_not_following() {
+        // The default profile view carries no viewer relationship.
+        let bot = MockBot::new().await;
+        let removed = bot.context().unfollow("stranger.test").await.expect("ok");
+        assert!(!removed, "not following → nothing to remove");
+        assert!(
+            bot.requests()
+                .iter()
+                .all(|r| r.nsid != "com.atproto.repo.deleteRecord"),
+            "must not delete anything when not following",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_reply_gate_puts_a_threadgate_sharing_the_post_rkey() {
+        use crate::context::ReplyGate;
+        let bot = MockBot::new().await;
+        let post_uri = format!("at://{}/app.bsky.feed.post/xyz", bot.context().did());
+        bot.context()
+            .set_reply_gate(&post_uri, [ReplyGate::Following, ReplyGate::Mentioned])
+            .await
+            .expect("gate ok");
+
+        let puts = puts(&bot);
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0]["collection"].as_str(),
+            Some("app.bsky.feed.threadgate")
+        );
+        assert_eq!(
+            puts[0]["rkey"].as_str(),
+            Some("xyz"),
+            "a thread-gate shares the record key of the post it governs",
+        );
+        let types: Vec<&str> = puts[0]["record"]["allow"]
+            .as_array()
+            .expect("allow list")
+            .iter()
+            .filter_map(|a| a["$type"].as_str())
+            .collect();
+        assert!(types.contains(&"app.bsky.feed.threadgate#followingRule"));
+        assert!(types.contains(&"app.bsky.feed.threadgate#mentionRule"));
+    }
+
+    #[tokio::test]
+    async fn disable_replies_writes_an_empty_allow_list() {
+        let bot = MockBot::new().await;
+        let post_uri = format!("at://{}/app.bsky.feed.post/xyz", bot.context().did());
+        bot.context().disable_replies(&post_uri).await.expect("ok");
+
+        let puts = puts(&bot);
+        assert_eq!(puts.len(), 1);
+        assert!(
+            puts[0]["record"]["allow"]
+                .as_array()
+                .expect("allow list")
+                .is_empty(),
+            "an empty allow list closes the thread to everyone but the author",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_display_name_preserves_the_existing_bio() {
+        let bot = MockBot::new().await;
+        // A profile already exists with a description that must survive the edit.
+        bot.set_profile_record(json!({
+            "$type": "app.bsky.actor.profile",
+            "description": "keep me",
+        }));
+        bot.context()
+            .set_display_name("New Name")
+            .await
+            .expect("ok");
+
+        let profile_puts: Vec<_> = puts(&bot)
+            .into_iter()
+            .filter(|p| p["collection"].as_str() == Some("app.bsky.actor.profile"))
+            .collect();
+        assert_eq!(profile_puts.len(), 1);
+        let rec = &profile_puts[0]["record"];
+        assert_eq!(rec["displayName"].as_str(), Some("New Name"));
+        assert_eq!(
+            rec["description"].as_str(),
+            Some("keep me"),
+            "read-modify-write must not drop the existing bio",
+        );
+    }
+
+    #[tokio::test]
+    async fn create_list_then_add_member_writes_list_and_listitem() {
+        let bot = MockBot::new().await;
+        bot.context()
+            .create_list("My List", Some("a list".into()))
+            .await
+            .expect("list ok");
+        let lists = bot.created_in("app.bsky.graph.list");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0]["name"].as_str(), Some("My List"));
+        assert_eq!(
+            lists[0]["purpose"].as_str(),
+            Some("app.bsky.graph.defs#curatelist"),
+        );
+
+        let list_uri = format!("at://{}/app.bsky.graph.list/l1", bot.context().did());
+        let member = "did:plc:member0000000000000000000";
+        bot.context()
+            .add_to_list(&list_uri, member)
+            .await
+            .expect("add ok");
+        let items = bot.created_in("app.bsky.graph.listitem");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["subject"].as_str(), Some(member));
+        assert_eq!(items[0]["list"].as_str(), Some(list_uri.as_str()));
+    }
+
+    // --- paginated reads (roadmap #8) --------------------------------------
+
+    #[tokio::test]
+    async fn followers_flattens_a_page_and_sends_the_actor() {
+        let bot = MockBot::new().await;
+        bot.set_read_response(
+            "app.bsky.graph.getFollowers",
+            json!({
+                "subject": { "did": "did:plc:target0000000000000000000", "handle": "target.test" },
+                "followers": [
+                    { "did": "did:plc:a0000000000000000000000000", "handle": "a.test" },
+                    { "did": "did:plc:b0000000000000000000000000", "handle": "b.test" },
+                ],
+            }),
+        );
+
+        let list = bot
+            .context()
+            .followers("target.test")
+            .collect_all()
+            .await
+            .expect("followers ok");
+        assert_eq!(list.len(), 2, "both followers on the page are yielded");
+        assert_eq!(list[0].handle.as_str(), "a.test");
+        assert_eq!(list[1].handle.as_str(), "b.test");
+
+        let reqs: Vec<_> = bot
+            .requests()
+            .into_iter()
+            .filter(|r| r.nsid == "app.bsky.graph.getFollowers")
+            .collect();
+        assert_eq!(reqs.len(), 1, "one page fetched (no cursor for a second)");
+        assert!(
+            reqs[0].has_query("actor", "target.test"),
+            "the read must carry the requested actor: {:?}",
+            reqs[0].query,
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_with_an_empty_feed_yields_nothing() {
+        let bot = MockBot::new().await;
+        let posts = bot
+            .context()
+            .timeline()
+            .take(10)
+            .collect_all()
+            .await
+            .expect("timeline ok");
+        assert!(posts.is_empty(), "an empty feed yields no items");
+        assert!(
+            bot.requests()
+                .iter()
+                .any(|r| r.nsid == "app.bsky.feed.getTimeline"),
+            "the timeline endpoint was actually queried",
+        );
+    }
+
+    #[tokio::test]
+    async fn user_posts_with_an_invalid_actor_errors_without_a_network_call() {
+        let bot = MockBot::new().await;
+        let mut stream = bot.context().user_posts("not a valid actor");
+        let first = stream.next().await.expect("one item");
+        assert!(
+            matches!(first, Err(crate::error::Error::InvalidInput(_))),
+            "an unparseable actor surfaces as an error, not a panic",
+        );
+        assert!(
+            bot.requests()
+                .iter()
+                .all(|r| r.nsid != "app.bsky.feed.getAuthorFeed"),
+            "a bad actor must not reach the network",
+        );
     }
 }

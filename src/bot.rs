@@ -1,5 +1,6 @@
 //! The [`Bot`] runtime and its [`BotBuilder`].
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -13,6 +14,9 @@ use atrium_xrpc_client::reqwest::ReqwestClient;
 use bsky_sdk::BskyAgent;
 use bsky_sdk::agent::config::{Config, FileStore};
 
+use crate::command::{
+    Command, CommandRouter, DmCommandRouter, boxed_command_handler, boxed_dm_command_handler,
+};
 use crate::config::BotConfig;
 use crate::context::{BotIdentity, Context};
 use crate::dedup::Dedup;
@@ -22,10 +26,13 @@ use crate::dm::{
 };
 use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
-use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
+use crate::handler::{
+    Flow, Handlers, boxed_after, boxed_error_handler, boxed_handler, boxed_middleware,
+};
 use crate::ratelimit::{RateLimitClient, RateLimitConfig, ServerRateLimit, WriteBudget};
 use crate::retry::{RetryPolicy, retry};
 use crate::schedule::{Schedule, Scheduler, boxed_task};
+use crate::store::Store;
 use crate::stream::{
     JetstreamConfig, Matcher, StreamEvent, StreamHandlers, StreamRunner,
     boxed_stream_error_handler, boxed_stream_handler,
@@ -80,11 +87,19 @@ pub struct BotBuilder {
     stream_handlers: StreamHandlers,
     dm_config: DmConfig,
     dm_handlers: DmHandlers,
+    /// Command dispatch table for mentions (roadmap #6). Synthesized into a
+    /// mention handler at build time when non-empty.
+    command_router: CommandRouter,
+    /// Command dispatch table for direct messages.
+    dm_command_router: DmCommandRouter,
     /// If set, publish the bot's chat inbox policy on startup.
     dm_access: Option<DmAccess>,
     /// If set, add (`true`) or remove (`false`) the `bot` self-label on the
     /// profile on startup — declaring the account automated.
     automated_label: Option<bool>,
+    /// Optional persistence backend for the watermark, idempotency set, and
+    /// handler-owned state (roadmap #10).
+    store: Option<Arc<dyn Store>>,
     /// The first error from a fallible scheduling call (e.g. a bad cron
     /// expression), surfaced from [`build`](BotBuilder::build) so the builder
     /// chain stays fluent.
@@ -198,6 +213,29 @@ impl BotBuilder {
     /// ```
     pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.config.retry = policy;
+        self
+    }
+
+    /// Attach a persistence backend ([`Store`]) for the notification watermark, the
+    /// idempotency set, and any conversation state your handlers keep.
+    ///
+    /// With a store configured, the bot **resumes** from the last processed
+    /// notification on restart instead of skipping whatever backlog exists at
+    /// startup — no missed notifications across downtime. Handlers reach the same
+    /// store through [`Context::store`](crate::Context::store) and the
+    /// [`remember`](crate::Context::remember) helpers. Two backends ship with the
+    /// crate: [`MemoryStore`](crate::store::MemoryStore) and
+    /// [`FileStore`](crate::store::FileStore).
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # use bsky_bot_sdk::store::MemoryStore;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.store(MemoryStore::new())
+    /// # }
+    /// ```
+    pub fn store<S: Store + 'static>(mut self, store: S) -> Self {
+        self.store = Some(Arc::new(store));
         self
     }
 
@@ -587,6 +625,196 @@ impl BotBuilder {
         self
     }
 
+    // --- commands & middleware ---------------------------------------------
+
+    /// Register a command handler for mentions.
+    ///
+    /// The bot recognizes commands in **mentions**: a mention like
+    /// `@yourbot weather London` dispatches the `weather` command with the parsed
+    /// [`Command`] (args `["London"]`). Matching is case-insensitive. By default the
+    /// first word after the bot's mention is the command; call
+    /// [`command_prefix`](Self::command_prefix) to require a sigil (`!weather`).
+    /// Commands compose with the middleware chain and with plain
+    /// [`on_mention`](Self::on_mention) handlers.
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.command("ping", |ctx, notif, _cmd| async move {
+    ///     ctx.reply_to(&notif, "pong").await?;
+    ///     Ok(())
+    /// })
+    /// .command("echo", |ctx, notif, cmd| async move {
+    ///     ctx.reply_to(&notif, cmd.rest()).await?;
+    ///     Ok(())
+    /// })
+    /// # }
+    /// ```
+    pub fn command<F, Fut>(mut self, name: impl AsRef<str>, handler: F) -> Self
+    where
+        F: Fn(Context, Notification, Command) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.command_router
+            .register(name.as_ref(), boxed_command_handler(handler));
+        self
+    }
+
+    /// Require mention commands to begin with `prefix` (e.g. `!` or `/`) after the
+    /// bot's mention. Without one, the first word after the mention is the command.
+    pub fn command_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.command_router.set_prefix(prefix.into());
+        self
+    }
+
+    /// Handle mentions that parse as a command but match no registered one (e.g.
+    /// to reply with a help message). Receives the parsed [`Command`].
+    pub fn default_command<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, Notification, Command) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.command_router
+            .set_fallback(boxed_command_handler(handler));
+        self
+    }
+
+    /// Register a command handler for **direct messages**.
+    ///
+    /// In a DM the first word is the command (no mention needed); call
+    /// [`dm_command_prefix`](Self::dm_command_prefix) to require a sigil. Registers
+    /// the DM ingestion loop, so a bot with only DM commands still runs.
+    pub fn dm_command<F, Fut>(mut self, name: impl AsRef<str>, handler: F) -> Self
+    where
+        F: Fn(Context, DirectMessage, Command) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.dm_command_router
+            .register(name.as_ref(), boxed_dm_command_handler(handler));
+        self
+    }
+
+    /// Require direct-message commands to begin with `prefix` (e.g. `!`). Without
+    /// one, the first word of the message is the command.
+    pub fn dm_command_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.dm_command_router.set_prefix(prefix.into());
+        self
+    }
+
+    /// Handle direct messages that parse as a command but match no registered one.
+    pub fn dm_default_command<F, Fut>(mut self, handler: F) -> Self
+    where
+        F: Fn(Context, DirectMessage, Command) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.dm_command_router
+            .set_fallback(boxed_dm_command_handler(handler));
+        self
+    }
+
+    /// Run `filter` before every notification handler.
+    ///
+    /// Returning [`Flow::Skip`] drops the notification: no handler and no `after`
+    /// hook run for it. Middleware runs in registration order and the first `Skip`
+    /// short-circuits. Use it for cross-cutting concerns — allow/block lists,
+    /// keyword gating, dedupe — without threading the check through every handler.
+    /// The convenience filters below ([`block_authors`](Self::block_authors),
+    /// [`allow_authors`](Self::allow_authors), [`ignore_self`](Self::ignore_self))
+    /// build on it.
+    pub fn before<F, Fut>(mut self, filter: F) -> Self
+    where
+        F: Fn(Context, Notification) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Flow> + Send + 'static,
+    {
+        self.handlers.add_before(boxed_middleware(filter));
+        self
+    }
+
+    /// Run `hook` after every notification's handlers have run. Skipped
+    /// notifications (see [`before`](Self::before)) do not run it.
+    pub fn after<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(Context, Notification) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.handlers.add_after(boxed_after(hook));
+        self
+    }
+
+    /// Process a notification only when `predicate` returns `true`.
+    ///
+    /// A convenience over [`before`](Self::before): `true` maps to
+    /// [`Flow::Continue`], `false` to [`Flow::Skip`].
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.filter(|_ctx, notif| async move {
+    ///     // Only react to mentions that mention "help".
+    ///     notif.text().is_some_and(|t| t.contains("help"))
+    /// })
+    /// # }
+    /// ```
+    pub fn filter<F, Fut>(self, predicate: F) -> Self
+    where
+        F: Fn(Context, Notification) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.before(move |ctx, notif| {
+            let decision = predicate(ctx, notif);
+            async move {
+                if decision.await {
+                    Flow::Continue
+                } else {
+                    Flow::Skip
+                }
+            }
+        })
+    }
+
+    /// Ignore notifications from the given authors (each a handle or a DID).
+    pub fn block_authors<I, S>(self, authors: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = authors
+            .into_iter()
+            .map(|s| s.into().to_lowercase())
+            .collect();
+        self.before(move |_ctx, notif| {
+            let blocked = set.contains(&notif.author_handle().to_lowercase())
+                || set.contains(&notif.author_did().to_lowercase());
+            async move { if blocked { Flow::Skip } else { Flow::Continue } }
+        })
+    }
+
+    /// Process notifications **only** from the given authors (each a handle or a
+    /// DID); drop all others. An allow-list.
+    pub fn allow_authors<I, S>(self, authors: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = authors
+            .into_iter()
+            .map(|s| s.into().to_lowercase())
+            .collect();
+        self.before(move |_ctx, notif| {
+            let allowed = set.contains(&notif.author_handle().to_lowercase())
+                || set.contains(&notif.author_did().to_lowercase());
+            async move { if allowed { Flow::Continue } else { Flow::Skip } }
+        })
+    }
+
+    /// Ignore notifications the bot itself generated (author DID equals the bot's).
+    pub fn ignore_self(self) -> Self {
+        self.before(|ctx, notif| {
+            let is_self = notif.author_did() == ctx.did();
+            async move { if is_self { Flow::Skip } else { Flow::Continue } }
+        })
+    }
+
     // --- self-labeling -----------------------------------------------------
 
     /// Declare the bot account **automated** by adding the `bot` self-label to its
@@ -698,7 +926,9 @@ impl BotBuilder {
         //    the window is exhausted.
         let budget = WriteBudget::new(self.config.rate_limit.as_ref()).with_server(server_limits);
 
-        let context = Context::new(agent, identity, budget).with_retry(self.config.retry.clone());
+        let context = Context::new(agent, identity, budget)
+            .with_retry(self.config.retry.clone())
+            .with_store(self.store.clone());
 
         // 7. Publish the chat inbox policy, if one was requested. Done here so a
         //    bot that wants to accept DMs from anyone is configured before it
@@ -716,15 +946,40 @@ impl BotBuilder {
             tracing::info!(automated, "applied automated self-label");
         }
 
+        // 9. Fold any command routers into the handler/DM registries as synthesized
+        //    handlers, so a mention/DM that parses as a command is dispatched to the
+        //    matching command. Done last so command-only bots still register real
+        //    work (and thus pass the `NoHandlers` guard) without the user also
+        //    wiring an `on_mention`/`on_message`.
+        let mut handlers = self.handlers;
+        if !self.command_router.is_empty() {
+            let router = Arc::new(self.command_router);
+            handlers.register(
+                NotificationReason::Mention,
+                boxed_handler(move |ctx, notif| {
+                    let router = Arc::clone(&router);
+                    async move { router.dispatch(ctx, notif).await }
+                }),
+            );
+        }
+        let mut dm_handlers = self.dm_handlers;
+        if !self.dm_command_router.is_empty() {
+            let router = Arc::new(self.dm_command_router);
+            dm_handlers.push(boxed_dm_handler(move |ctx, dm| {
+                let router = Arc::clone(&router);
+                async move { router.dispatch(ctx, dm).await }
+            }));
+        }
+
         Ok(Bot {
             context,
             config: self.config,
-            handlers: self.handlers,
+            handlers,
             scheduler: self.scheduler,
             stream_config: self.stream_config,
             stream_handlers: self.stream_handlers,
             dm_config: self.dm_config,
-            dm_handlers: self.dm_handlers,
+            dm_handlers,
         })
     }
 }
@@ -862,8 +1117,15 @@ impl Bot {
     {
         let mut dedup = Dedup::new();
 
-        // Unless asked to drain it, skip whatever backlog exists at startup.
-        if !self.config.process_backlog {
+        // With a store, resume from the persisted watermark so a restart continues
+        // exactly where it left off (no missed notifications across downtime).
+        let restored = self.restore_watermark().await;
+        if let Some(saved) = restored {
+            dedup = saved;
+            tracing::info!("restored notification watermark from store");
+        } else if !self.config.process_backlog {
+            // No persisted watermark: unless asked to drain it, skip whatever
+            // backlog exists at startup, then remember that decision.
             match self.fetch().await {
                 Ok(notifs) => {
                     tracing::info!(
@@ -871,6 +1133,7 @@ impl Bot {
                         "priming watermark; skipping existing backlog"
                     );
                     dedup.prime(&notifs);
+                    self.persist_watermark(&dedup).await;
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "initial fetch failed; backlog not primed");
@@ -919,14 +1182,57 @@ impl Bot {
             self.handlers.dispatch(self.context.clone(), notif).await;
         }
 
-        if count > 0
-            && self.config.mark_seen
-            && let Err(err) = self.mark_seen().await
-        {
-            tracing::warn!(error = %err, "failed to mark notifications seen");
+        if count > 0 {
+            if self.config.mark_seen
+                && let Err(err) = self.mark_seen().await
+            {
+                tracing::warn!(error = %err, "failed to mark notifications seen");
+            }
+            // Persist the advanced watermark so a restart resumes past this batch.
+            self.persist_watermark(dedup).await;
         }
 
         Ok(count)
+    }
+
+    /// The store key under which the notification watermark is persisted.
+    const WATERMARK_KEY: &'static str = "bsky_bot_sdk:notif_watermark";
+
+    /// Load a persisted watermark from the configured [`Store`], if any. A store
+    /// that has never saved one (first run), or an unreadable/corrupt value, yields
+    /// `None` so the caller falls back to priming.
+    async fn restore_watermark(&self) -> Option<Dedup> {
+        let store = self.context.store()?;
+        match store.load(Self::WATERMARK_KEY).await {
+            Ok(Some(json)) => match Dedup::from_json(&json) {
+                Ok(dedup) => Some(dedup),
+                Err(err) => {
+                    tracing::warn!(error = %err, "stored watermark could not be parsed; ignoring");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load watermark from store");
+                None
+            }
+        }
+    }
+
+    /// Persist the current watermark to the configured [`Store`]. Best-effort: a
+    /// failure is logged, never fatal. A no-op with no store.
+    async fn persist_watermark(&self, dedup: &Dedup) {
+        let Some(store) = self.context.store() else {
+            return;
+        };
+        match dedup.to_json() {
+            Ok(json) => {
+                if let Err(err) = store.save(Self::WATERMARK_KEY, &json).await {
+                    tracing::warn!(error = %err, "failed to persist watermark to store");
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to serialize watermark"),
+        }
     }
 
     /// Fetch the current page of notifications, applying any reason filter.
@@ -1107,6 +1413,70 @@ mod tests {
         }
     }
 
+    fn watermark_notif(uri: &str, indexed_at: &str) -> Notification {
+        let value = serde_json::json!({
+            "author": { "did": "did:plc:alice000000000000000000", "handle": "alice.test" },
+            "cid": "bafyreiclp443lavogvhj3d2ob2cxbfuscni2k5jk7bebjzg7khl3esabwq",
+            "indexedAt": indexed_at,
+            "isRead": false,
+            "reason": "mention",
+            "record": { "$type": "app.bsky.feed.post", "text": "hi", "createdAt": indexed_at },
+            "uri": uri,
+        });
+        Notification::new(serde_json::from_value(value).expect("valid notification fixture"))
+    }
+
+    #[tokio::test]
+    async fn watermark_persists_and_restores_through_the_store() {
+        let store = crate::store::MemoryStore::new();
+        let agent = crate::ratelimit::test_agent().await;
+        let identity = Arc::new(BotIdentity::new(
+            "did:plc:bot00000000000000000000000"
+                .parse()
+                .expect("valid did"),
+            "bot.test".parse().expect("valid handle"),
+        ));
+        let context = Context::new(agent, identity, WriteBudget::new(None))
+            .with_store(Some(Arc::new(store.clone())));
+        let mut handlers = Handlers::default();
+        handlers.register_any(boxed_handler(|_c, _n| async move { Ok(()) }));
+        let bot = Bot {
+            context,
+            config: BotConfig::default(),
+            handlers,
+            scheduler: Scheduler::default(),
+            stream_config: JetstreamConfig::default(),
+            stream_handlers: StreamHandlers::default(),
+            dm_config: DmConfig::default(),
+            dm_handlers: DmHandlers::default(),
+        };
+
+        // Nothing persisted yet → restore yields None (caller falls back to prime).
+        assert!(
+            bot.restore_watermark().await.is_none(),
+            "an empty store has no watermark to restore",
+        );
+
+        // Persist a watermark that has already seen one notification…
+        let seen = watermark_notif("at://x/1", "2026-07-22T10:00:00.000Z");
+        let mut dedup = Dedup::new();
+        dedup.mark(&seen);
+        bot.persist_watermark(&dedup).await;
+        assert_eq!(store.len(), 1, "the watermark was written to the store");
+
+        // …and a fresh restore reconstructs it: the seen item stays seen, newer
+        // work is still fresh.
+        let restored = bot.restore_watermark().await.expect("watermark restored");
+        assert!(
+            !restored.is_new(&seen),
+            "the already-processed notification must not be reprocessed after restart",
+        );
+        assert!(
+            restored.is_new(&watermark_notif("at://x/2", "2026-07-22T11:00:00.000Z")),
+            "genuinely newer work is still handled after a restart",
+        );
+    }
+
     #[tokio::test]
     async fn run_until_errors_when_there_is_nothing_to_do() {
         let bot = offline_bot(false, false, false, false).await;
@@ -1180,6 +1550,31 @@ mod tests {
 
         let builder = Bot::builder().accept_dms_from(DmAccess::Everyone);
         assert_eq!(builder.dm_access, Some(DmAccess::Everyone));
+    }
+
+    #[test]
+    fn commands_and_middleware_register_on_the_builder() {
+        let builder = Bot::builder()
+            .command("ping", |_c, _n, _cmd| async move { Ok(()) })
+            .command_prefix("!")
+            .dm_command("subscribe", |_c, _dm, _cmd| async move { Ok(()) })
+            .block_authors(["spammer.test"])
+            .ignore_self();
+
+        assert!(
+            !builder.command_router.is_empty(),
+            "a registered command populates the router"
+        );
+        assert!(
+            !builder.dm_command_router.is_empty(),
+            "a registered dm command populates the dm router"
+        );
+        // `block_authors` + `ignore_self` are `before` middleware; a bot with only
+        // middleware and a command should not be considered handler-less.
+        assert!(
+            !builder.handlers.is_empty() || !builder.command_router.is_empty(),
+            "a command-only bot has real work to do",
+        );
     }
 
     #[test]
