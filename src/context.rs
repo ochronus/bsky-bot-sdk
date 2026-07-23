@@ -23,7 +23,7 @@ use crate::dm::{DirectMessage, DmAccess};
 use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
-use crate::ratelimit::WriteBudget;
+use crate::ratelimit::{RateLimitClient, RateLimitStatus, WriteBudget};
 use crate::retry::{RetryPolicy, retry};
 use crate::self_label::{has_bot_label, set_bot_label};
 use crate::thread::ThreadBuilder;
@@ -114,14 +114,18 @@ impl BotIdentity {
 /// the configured write rate limit.
 #[derive(Clone)]
 pub struct Context {
-    agent: BskyAgent,
+    agent: BskyAgent<RateLimitClient>,
     identity: Arc<BotIdentity>,
     budget: WriteBudget,
     retry: RetryPolicy,
 }
 
 impl Context {
-    pub(crate) fn new(agent: BskyAgent, identity: Arc<BotIdentity>, budget: WriteBudget) -> Self {
+    pub(crate) fn new(
+        agent: BskyAgent<RateLimitClient>,
+        identity: Arc<BotIdentity>,
+        budget: WriteBudget,
+    ) -> Self {
         Self {
             agent,
             identity,
@@ -137,13 +141,27 @@ impl Context {
     }
 
     /// The authenticated agent, for calls not covered by the helpers below.
-    pub fn agent(&self) -> &BskyAgent {
+    ///
+    /// Its client is a [`RateLimitClient`], which records the server's
+    /// `RateLimit-*` headers; every helper method is generic over the client, so
+    /// this reads exactly like a plain `BskyAgent`.
+    pub fn agent(&self) -> &BskyAgent<RateLimitClient> {
         &self.agent
     }
 
     /// The bot's own identity (DID + handle).
     pub fn me(&self) -> &BotIdentity {
         &self.identity
+    }
+
+    /// The server's most recently reported rate-limit status (from Bluesky's
+    /// `RateLimit-*` response headers), or `None` if it has not reported any yet.
+    ///
+    /// This is the server's truth, as opposed to the client-side estimate the
+    /// [`RateLimiter`](crate::RateLimiter) maintains. Writes issued through this
+    /// context already wait when the server reports the window exhausted.
+    pub fn server_rate_limit(&self) -> Option<RateLimitStatus> {
+        self.budget.server_status()
     }
 
     /// The bot's DID.

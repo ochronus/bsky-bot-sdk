@@ -56,7 +56,7 @@ still needs the loop around it. This crate provides:
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Resilience** | Transient failures (network blips, 5xx, throttling) on the poll loops and idempotent reads are retried with jittered backoff (`retry_policy`); the Jetstream stream auto-reconnects. Writes are never blindly retried. |
-| **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
+| **Rate limiting** | A token bucket models Bluesky's points-based write budget (on by default), *and* the SDK reads the server's `RateLimit-*` headers (`ctx.server_rate_limit()`) and waits when the server says the window is exhausted. |
 | **Scheduling** | Run actions on an interval or a cron schedule (`every`, `cron`) — many at once, alongside the notification loop. |
 | **Shutdown** | `run()` stops cleanly on `Ctrl-C`; `run_until(future)` stops on any signal you choose. |
 
@@ -442,6 +442,28 @@ back-pressure automatically instead of being rejected. Tune or disable it:
 # fn demo(b: BotBuilder) -> BotBuilder {
 b.rate_limit(Some(RateLimitConfig { points_per_hour: 3000, ..Default::default() }))
 // or: .rate_limit(None) to disable entirely
+# }
+```
+
+That points budget is a client-side *estimate*. The server also enforces
+request-count limits (e.g. 3000 requests / 5 min) and reports the truth on every
+response via `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` headers
+— which atrium's high-level client discards. This SDK installs a thin
+`RateLimitClient` on the agent that records those headers, so it can honor and
+surface the server's real limits:
+
+- **Pre-emptive**: before each write, if the server last reported the window
+  *exhausted*, the write waits until the reset — pre-empting a 429 rather than
+  absorbing one.
+- **Observable**: read the latest snapshot any time.
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# async fn demo(ctx: Context) {
+if let Some(rl) = ctx.server_rate_limit() {
+    println!("server says {:?}/{:?} remaining, resets at {:?}",
+        rl.remaining, rl.limit, rl.reset_unix);
+}
 # }
 ```
 

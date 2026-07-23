@@ -178,10 +178,11 @@ dependencies = [
 
 [[package]]
 name = "bsky-bot-sdk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "atrium-api",
+ "atrium-xrpc-client",
  "bsky-sdk",
  "chrono",
  "croner",

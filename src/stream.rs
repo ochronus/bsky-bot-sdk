@@ -1147,10 +1147,7 @@ mod tests {
     // --- dispatch ----------------------------------------------------------
 
     async fn test_context() -> Context {
-        let agent = bsky_sdk::BskyAgent::builder()
-            .build()
-            .await
-            .expect("build agent");
+        let agent = crate::ratelimit::test_agent().await;
         let identity = Arc::new(BotIdentity::new(
             "did:plc:bot00000000000000000000000"
                 .parse()

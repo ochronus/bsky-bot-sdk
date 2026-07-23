@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+### Added
+
+- **Honor the server's `RateLimit-*` response headers.** The client-side points
+  budget is an estimate; Bluesky reports the truth (including request-count limits
+  the point budget doesn't model, e.g. 3000 requests / 5 min) on every response —
+  headers that atrium's high-level client discards. The SDK now installs a thin
+  `RateLimitClient` on its agent that records `RateLimit-Limit` /
+  `RateLimit-Remaining` / `RateLimit-Reset` as a side effect of every response:
+  - **Pre-emptive throttling**: before each write, if the server last reported the
+    window exhausted, the write waits until the reset — pre-empting a 429 instead
+    of absorbing one.
+  - **Observability**: `Context::server_rate_limit() -> Option<RateLimitStatus>`
+    exposes the latest snapshot.
+  - This completes the resilience roadmap item (reconnect + retry + server limits).
+
+### Changed
+
+- `Bot::agent()` and `Context::agent()` now return `&BskyAgent<RateLimitClient>`
+  rather than the default `&BskyAgent`. Every agent method is generic over the
+  client, so call sites are unaffected; only an explicit `&BskyAgent` type
+  annotation on the result would need updating. Added a direct dependency on
+  `atrium-xrpc-client` (already present transitively, so no new crate).
+
 ## [0.8.0] - 2026-07-23
 
 ### Added

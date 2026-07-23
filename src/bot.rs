@@ -9,6 +9,7 @@ use std::time::Duration;
 use atrium_api::app::bsky::notification::{list_notifications, update_seen};
 use atrium_api::types::LimitedNonZeroU8;
 use atrium_api::types::string::Datetime;
+use atrium_xrpc_client::reqwest::ReqwestClient;
 use bsky_sdk::BskyAgent;
 use bsky_sdk::agent::config::{Config, FileStore};
 
@@ -22,7 +23,7 @@ use crate::dm::{
 use crate::error::{Error, Result};
 use crate::event::{Notification, NotificationReason};
 use crate::handler::{Handlers, boxed_error_handler, boxed_handler};
-use crate::ratelimit::{RateLimitConfig, WriteBudget};
+use crate::ratelimit::{RateLimitClient, RateLimitConfig, ServerRateLimit, WriteBudget};
 use crate::retry::{RetryPolicy, retry};
 use crate::schedule::{Schedule, Scheduler, boxed_task};
 use crate::stream::{
@@ -645,8 +646,16 @@ impl BotBuilder {
             .unwrap_or_else(|| self.config.service.clone());
 
         // 2. Build the agent aimed at the resolved endpoint (no session yet, so a
-        //    stale saved session can't fail the whole build).
+        //    stale saved session can't fail the whole build). Its client is a
+        //    `RateLimitClient` that records the server's `RateLimit-*` headers into
+        //    a shared snapshot; the endpoint is applied by `configure_endpoint`
+        //    inside `build()`, so wrapping the inner client does not affect routing.
+        let server_limits = Arc::new(ServerRateLimit::default());
         let agent = BskyAgent::builder()
+            .client(RateLimitClient::new(
+                ReqwestClient::new(&endpoint),
+                Arc::clone(&server_limits),
+            ))
             .config(Config {
                 endpoint,
                 ..Default::default()
@@ -684,8 +693,10 @@ impl BotBuilder {
             session.data.handle.clone(),
         ));
 
-        // 6. Assemble the write budget (rate limiter + per-operation costs).
-        let budget = WriteBudget::new(self.config.rate_limit.as_ref());
+        // 6. Assemble the write budget (rate limiter + per-operation costs), and
+        //    attach the server-reported limits so writes wait when the server says
+        //    the window is exhausted.
+        let budget = WriteBudget::new(self.config.rate_limit.as_ref()).with_server(server_limits);
 
         let context = Context::new(agent, identity, budget).with_retry(self.config.retry.clone());
 
@@ -742,8 +753,9 @@ impl Bot {
         &self.context
     }
 
-    /// The authenticated agent.
-    pub fn agent(&self) -> &BskyAgent {
+    /// The authenticated agent (its client records the server's `RateLimit-*`
+    /// headers; every method reads like a plain `BskyAgent`).
+    pub fn agent(&self) -> &BskyAgent<RateLimitClient> {
         self.context.agent()
     }
 
@@ -1051,10 +1063,7 @@ mod tests {
         with_stream: bool,
         with_dm: bool,
     ) -> Bot {
-        let agent = bsky_sdk::BskyAgent::builder()
-            .build()
-            .await
-            .expect("build agent");
+        let agent = crate::ratelimit::test_agent().await;
         let identity = Arc::new(BotIdentity::new(
             "did:plc:bot00000000000000000000000"
                 .parse()

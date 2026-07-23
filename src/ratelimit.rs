@@ -12,8 +12,12 @@
 //! to Bluesky's defaults via [`RateLimitConfig`].
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use atrium_api::xrpc::http::{HeaderMap, Request, Response};
+use atrium_api::xrpc::{HttpClient, XrpcClient};
+use atrium_xrpc_client::reqwest::ReqwestClient;
 use tokio::sync::Mutex;
 
 /// Configuration describing Bluesky's points-based write budget.
@@ -37,6 +41,139 @@ impl Default for RateLimitConfig {
             update_cost: 2,
             delete_cost: 1,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server-reported limits (`RateLimit-*` response headers)
+// ---------------------------------------------------------------------------
+
+/// A snapshot of Bluesky's rate-limit state as it last told us, via the
+/// `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` response
+/// headers.
+///
+/// The client-side [`RateLimiter`] is an *estimate*; this is the server's truth.
+/// Read it with [`Context::server_rate_limit`](crate::Context::server_rate_limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// The ceiling for the current window, if the server reported one.
+    pub limit: Option<u64>,
+    /// Requests remaining in the current window, if reported.
+    pub remaining: Option<u64>,
+    /// Unix timestamp (seconds) at which the window resets, if reported.
+    pub reset_unix: Option<u64>,
+}
+
+/// The server's most recently observed rate-limit state, shared (via [`Arc`])
+/// between the [`RateLimitClient`] that records it and the [`WriteBudget`] that
+/// honors it. Interior-mutable via atomics; `-1` / `0` mean "not yet observed".
+#[derive(Debug)]
+pub(crate) struct ServerRateLimit {
+    limit: AtomicI64,
+    remaining: AtomicI64,
+    reset: AtomicI64,
+}
+
+impl Default for ServerRateLimit {
+    fn default() -> Self {
+        Self {
+            limit: AtomicI64::new(-1),
+            remaining: AtomicI64::new(-1),
+            reset: AtomicI64::new(0),
+        }
+    }
+}
+
+impl ServerRateLimit {
+    /// Record any `RateLimit-*` headers present on a response.
+    fn observe(&self, headers: &HeaderMap) {
+        if let Some(v) = header_i64(headers, "ratelimit-limit") {
+            self.limit.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = header_i64(headers, "ratelimit-remaining") {
+            self.remaining.store(v, Ordering::Relaxed);
+        }
+        if let Some(v) = header_i64(headers, "ratelimit-reset") {
+            self.reset.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// A public snapshot, or `None` if the server has not reported limits yet.
+    fn status(&self) -> Option<RateLimitStatus> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let reset = self.reset.load(Ordering::Relaxed);
+        if limit < 0 && remaining < 0 && reset == 0 {
+            return None;
+        }
+        Some(RateLimitStatus {
+            limit: u64::try_from(limit).ok(),
+            remaining: u64::try_from(remaining).ok(),
+            reset_unix: u64::try_from(reset).ok().filter(|&r| r > 0),
+        })
+    }
+
+    /// If the server last reported *zero* remaining, the [`Duration`] to wait
+    /// until its reset (capped at one hour); otherwise `None`.
+    ///
+    /// Because this is a single last-writer-wins snapshot across all routes, the
+    /// exhausted limit may belong to a different route than the imminent call —
+    /// so at worst this waits when it needn't, erring toward politeness.
+    fn wait_until_reset(&self) -> Option<Duration> {
+        if self.remaining.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let reset = self.reset.load(Ordering::Relaxed);
+        if reset <= 0 {
+            return None;
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+        let secs = reset - now;
+        if secs <= 0 {
+            return None;
+        }
+        Some(Duration::from_secs(secs.min(3600) as u64))
+    }
+}
+
+/// Parse a header value as an `i64`, if present and well-formed.
+fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// An XRPC client that wraps the reqwest-backed [`ReqwestClient`] and records
+/// Bluesky's `RateLimit-*` response headers as a side effect of every response,
+/// so a bot can honor — and inspect — the server's real limits.
+///
+/// This is the client the SDK installs on its agent; you rarely name it directly,
+/// but it appears in the type of [`Bot::agent`](crate::Bot::agent).
+#[derive(Clone)]
+pub struct RateLimitClient {
+    inner: ReqwestClient,
+    limits: Arc<ServerRateLimit>,
+}
+
+impl RateLimitClient {
+    pub(crate) fn new(inner: ReqwestClient, limits: Arc<ServerRateLimit>) -> Self {
+        Self { inner, limits }
+    }
+}
+
+impl HttpClient for RateLimitClient {
+    async fn send_http(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> core::result::Result<Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
+        let response = self.inner.send_http(request).await?;
+        self.limits.observe(response.headers());
+        Ok(response)
+    }
+}
+
+impl XrpcClient for RateLimitClient {
+    fn base_uri(&self) -> String {
+        self.inner.base_uri()
     }
 }
 
@@ -133,6 +270,8 @@ impl RateLimiter {
 #[derive(Clone)]
 pub(crate) struct WriteBudget {
     limiter: Option<Arc<RateLimiter>>,
+    /// The server's reported limits, honored before each write when present.
+    server: Option<Arc<ServerRateLimit>>,
     create_cost: f64,
     delete_cost: f64,
 }
@@ -143,19 +282,48 @@ impl WriteBudget {
         match config {
             Some(cfg) => Self {
                 limiter: Some(Arc::new(RateLimiter::from_config(cfg))),
+                server: None,
                 create_cost: f64::from(cfg.create_cost),
                 delete_cost: f64::from(cfg.delete_cost),
             },
             None => Self {
                 limiter: None,
+                server: None,
                 create_cost: 0.0,
                 delete_cost: 0.0,
             },
         }
     }
 
+    /// Attach the shared server-rate-limit snapshot, so writes wait when the
+    /// server says the current window is exhausted.
+    pub(crate) fn with_server(mut self, server: Arc<ServerRateLimit>) -> Self {
+        self.server = Some(server);
+        self
+    }
+
+    /// The server's last-reported rate-limit status, if any.
+    pub(crate) fn server_status(&self) -> Option<RateLimitStatus> {
+        self.server.as_ref().and_then(|s| s.status())
+    }
+
+    /// If the server reported the window exhausted, wait until it resets. This
+    /// pre-empts a 429 rather than absorbing one.
+    async fn await_server_reset(&self) {
+        if let Some(server) = &self.server
+            && let Some(wait) = server.wait_until_reset()
+        {
+            tracing::warn!(
+                secs = wait.as_secs(),
+                "server rate limit exhausted; waiting until it resets"
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     /// Wait until a record creation is within budget (no-op if unlimited).
     pub(crate) async fn charge_create(&self) {
+        self.await_server_reset().await;
         if let Some(limiter) = &self.limiter {
             limiter.acquire(self.create_cost).await;
         }
@@ -163,15 +331,131 @@ impl WriteBudget {
 
     /// Wait until a record deletion is within budget (no-op if unlimited).
     pub(crate) async fn charge_delete(&self) {
+        self.await_server_reset().await;
         if let Some(limiter) = &self.limiter {
             limiter.acquire(self.delete_cost).await;
         }
     }
 }
 
+/// Build a session-less `BskyAgent<RateLimitClient>` for tests. No network I/O
+/// happens without a session, so this is offline. Shared by the crate's other
+/// test modules, which need a context backed by the same client type production
+/// uses.
+#[cfg(test)]
+pub(crate) async fn test_agent() -> bsky_sdk::BskyAgent<RateLimitClient> {
+    let limits = Arc::new(ServerRateLimit::default());
+    bsky_sdk::BskyAgent::builder()
+        .client(RateLimitClient::new(
+            ReqwestClient::new("https://bsky.social"),
+            limits,
+        ))
+        .build()
+        .await
+        .expect("build test agent")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atrium_api::xrpc::http::{HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn observe_parses_ratelimit_headers() {
+        let server = ServerRateLimit::default();
+        assert_eq!(server.status(), None, "nothing observed yet");
+
+        server.observe(&headers(&[
+            ("ratelimit-limit", "3000"),
+            ("ratelimit-remaining", "2999"),
+            ("ratelimit-reset", "1700000000"),
+        ]));
+        let status = server.status().expect("observed");
+        assert_eq!(status.limit, Some(3000));
+        assert_eq!(status.remaining, Some(2999));
+        assert_eq!(status.reset_unix, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn observe_ignores_absent_or_malformed_headers() {
+        let server = ServerRateLimit::default();
+        // Only remaining present; a garbage reset must be ignored, not zero it.
+        server.observe(&headers(&[
+            ("ratelimit-remaining", "10"),
+            ("ratelimit-reset", "not-a-number"),
+        ]));
+        let status = server.status().expect("remaining was observed");
+        assert_eq!(status.remaining, Some(10));
+        assert_eq!(status.limit, None, "limit was never sent");
+        assert_eq!(status.reset_unix, None, "malformed reset must be ignored");
+    }
+
+    #[test]
+    fn wait_until_reset_only_when_exhausted_with_a_future_reset() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Exhausted, reset 100s out → wait ~100s.
+        let exhausted = ServerRateLimit::default();
+        exhausted.observe(&headers(&[
+            ("ratelimit-remaining", "0"),
+            ("ratelimit-reset", &(now + 100).to_string()),
+        ]));
+        let wait = exhausted
+            .wait_until_reset()
+            .expect("should wait when exhausted");
+        assert!(
+            wait.as_secs() >= 95 && wait.as_secs() <= 100,
+            "expected ~100s, got {wait:?}"
+        );
+
+        // Not exhausted → never wait.
+        let ok = ServerRateLimit::default();
+        ok.observe(&headers(&[("ratelimit-remaining", "5")]));
+        assert!(ok.wait_until_reset().is_none(), "remaining>0 must not wait");
+
+        // Exhausted but reset already passed → don't wait.
+        let stale = ServerRateLimit::default();
+        stale.observe(&headers(&[
+            ("ratelimit-remaining", "0"),
+            ("ratelimit-reset", &(now - 10).to_string()),
+        ]));
+        assert!(
+            stale.wait_until_reset().is_none(),
+            "a past reset must not wait"
+        );
+    }
+
+    #[test]
+    fn wait_until_reset_is_capped_at_one_hour() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let server = ServerRateLimit::default();
+        server.observe(&headers(&[
+            ("ratelimit-remaining", "0"),
+            ("ratelimit-reset", &(now + 100_000).to_string()),
+        ]));
+        assert_eq!(
+            server.wait_until_reset().map(|d| d.as_secs()),
+            Some(3600),
+            "a far-future reset must be capped at one hour"
+        );
+    }
 
     #[test]
     fn bucket_refills_linearly_and_caps_at_capacity() {

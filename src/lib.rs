@@ -38,8 +38,10 @@
 //!   [`RetryPolicy`] and [`retry_policy`](BotBuilder::retry_policy)); the
 //!   Jetstream stream auto-reconnects. Record writes are never blindly retried.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
-//! - **Client-side rate limiting** that respects Bluesky's points-based write
-//!   budget.
+//! - **Rate limiting** — a client-side token bucket models Bluesky's points-based
+//!   write budget, *and* the SDK records the server's `RateLimit-*` response
+//!   headers ([`Context::server_rate_limit`]) and waits when the server reports
+//!   the window exhausted, so writes pre-empt a 429 instead of absorbing one.
 //! - **Scheduling** — run actions on an interval or a cron schedule (see
 //!   [`Schedule`] and [`BotBuilder::every`]/[`BotBuilder::cron`]).
 //! - **Graceful shutdown** on `Ctrl-C` or any future you provide.
@@ -112,7 +114,7 @@ pub use embed::{MAX_IMAGES, PostBuilder};
 pub use error::{Error, Result};
 pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;
-pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use ratelimit::{RateLimitClient, RateLimitConfig, RateLimitStatus, RateLimiter};
 pub use retry::RetryPolicy;
 pub use schedule::{Schedule, Tz};
 pub use self_label::BOT_SELF_LABEL;

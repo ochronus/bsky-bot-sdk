@@ -106,10 +106,7 @@ mod tests {
 
     async fn test_context() -> Context {
         // Building an agent performs no network I/O when there is no session.
-        let agent = bsky_sdk::BskyAgent::builder()
-            .build()
-            .await
-            .expect("build agent");
+        let agent = crate::ratelimit::test_agent().await;
         let identity = Arc::new(BotIdentity::new(
             "did:plc:bot00000000000000000000000"
                 .parse()

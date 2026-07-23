@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
@@ -19,6 +19,11 @@ readme = "README.md"
 # Underlying Bluesky client + generated AT Protocol types.
 bsky-sdk = "0.1.24"
 atrium-api = "0.25.8"
+# The reqwest-backed XRPC client, wrapped to observe the server's `RateLimit-*`
+# response headers (atrium's high-level client otherwise discards them). Already
+# in the tree via `bsky-sdk`'s `default-client`, so declaring it directly and
+# enabling the `reqwest` module adds no new crate and keeps the native-tls stack.
+atrium-xrpc-client = { version = "0.5", features = ["reqwest"] }
 
 tokio = { version = "1", features = [
     "rt",
