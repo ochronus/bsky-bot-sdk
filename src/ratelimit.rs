@@ -141,21 +141,44 @@ fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
     headers.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// The transport a [`RateLimitClient`] delegates to: the real reqwest client in
+/// production, or an in-process mock in tests (see [`crate::testkit`]).
+#[derive(Clone)]
+enum Transport {
+    Real(ReqwestClient),
+    Mock(Arc<crate::testkit::MockTransport>),
+}
+
 /// An XRPC client that wraps the reqwest-backed [`ReqwestClient`] and records
 /// Bluesky's `RateLimit-*` response headers as a side effect of every response,
 /// so a bot can honor — and inspect — the server's real limits.
 ///
 /// This is the client the SDK installs on its agent; you rarely name it directly,
-/// but it appears in the type of [`Bot::agent`](crate::Bot::agent).
+/// but it appears in the type of [`Bot::agent`](crate::Bot::agent). In tests it
+/// can instead front an in-process mock ([`crate::testkit::MockBot`]).
 #[derive(Clone)]
 pub struct RateLimitClient {
-    inner: ReqwestClient,
+    inner: Transport,
     limits: Arc<ServerRateLimit>,
 }
 
 impl RateLimitClient {
     pub(crate) fn new(inner: ReqwestClient, limits: Arc<ServerRateLimit>) -> Self {
-        Self { inner, limits }
+        Self {
+            inner: Transport::Real(inner),
+            limits,
+        }
+    }
+
+    /// Back the client with an in-process mock transport instead of the network.
+    pub(crate) fn mock(
+        mock: Arc<crate::testkit::MockTransport>,
+        limits: Arc<ServerRateLimit>,
+    ) -> Self {
+        Self {
+            inner: Transport::Mock(mock),
+            limits,
+        }
     }
 }
 
@@ -165,7 +188,10 @@ impl HttpClient for RateLimitClient {
         request: Request<Vec<u8>>,
     ) -> core::result::Result<Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>>
     {
-        let response = self.inner.send_http(request).await?;
+        let response = match &self.inner {
+            Transport::Real(client) => client.send_http(request).await?,
+            Transport::Mock(mock) => mock.respond(request),
+        };
         self.limits.observe(response.headers());
         Ok(response)
     }
@@ -173,7 +199,10 @@ impl HttpClient for RateLimitClient {
 
 impl XrpcClient for RateLimitClient {
     fn base_uri(&self) -> String {
-        self.inner.base_uri()
+        match &self.inner {
+            Transport::Real(client) => client.base_uri(),
+            Transport::Mock(_) => "http://mock.invalid".to_string(),
+        }
     }
 }
 

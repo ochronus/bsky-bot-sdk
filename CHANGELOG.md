@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-23
+
+### Added
+
+- **Test harness (`testkit`).** Unit-test bot logic without a network. `MockBot`
+  hands you a *real* `Context` — the exact type handlers take — whose XRPC calls
+  are served in-process by canned responses (no sockets, no credentials), and
+  records every request so you can assert on what the handler did:
+  - Input fixtures: `mention`, `reply`, `follow`, `like`, `repost`, `quote`,
+    `direct_message`, and `stream_post`.
+  - Assertions: `requests()`, `created()` / `created_in(collection)`, `posts()`;
+    prime `getRecord` with `set_profile_record`.
+  - Writes, `updateSeen`, `uploadBlob`, and chat `sendMessage` are mocked. The one
+    call that still hits the network is resolving an `@mention` in a post's *text*
+    (handles resolve via Bluesky's public API), so keep asserted text mention-free.
+  - The harness reuses the production `RateLimitClient` (now backed by either the
+    real transport or an in-process mock), so the mocked `Context` is the same
+    concrete type as a live one — your real handlers run unchanged.
+
 ## [0.9.0] - 2026-07-23
 
 ### Added

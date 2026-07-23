@@ -58,6 +58,7 @@ still needs the loop around it. This crate provides:
 | **Resilience** | Transient failures (network blips, 5xx, throttling) on the poll loops and idempotent reads are retried with jittered backoff (`retry_policy`); the Jetstream stream auto-reconnects. Writes are never blindly retried. |
 | **Rate limiting** | A token bucket models Bluesky's points-based write budget (on by default), *and* the SDK reads the server's `RateLimit-*` headers (`ctx.server_rate_limit()`) and waits when the server says the window is exhausted. |
 | **Scheduling** | Run actions on an interval or a cron schedule (`every`, `cron`) — many at once, alongside the notification loop. |
+| **Test harness** | `testkit::MockBot` gives a real `Context` served in-process (no network, no credentials) plus input fixtures, so you unit-test handler logic and assert on what it did. |
 | **Shutdown** | `run()` stops cleanly on `Ctrl-C`; `run_until(future)` stops on any signal you choose. |
 
 ## Installation
@@ -490,6 +491,44 @@ loop {
 }
 # }
 ```
+
+## Testing your bot
+
+Bot logic is normally awkward to test: your handler wants a `Context`, and a
+`Context` wants a live, authenticated agent. `testkit::MockBot` gives you a **real
+`Context`** — the exact type your handlers take — whose XRPC calls are served
+**in-process** by canned responses, with **no network and no credentials**. It
+records every request, so you assert on what the handler actually did. Because the
+`Context` is the real type, you call your handler directly:
+
+```rust
+use bsky_bot_sdk::prelude::*;
+use bsky_bot_sdk::testkit::MockBot;
+
+// The handler under test — the same signature `on_follow` / `on_mention` take.
+async fn follow_back(ctx: Context, notif: Notification) -> Result<()> {
+    ctx.follow_back(&notif).await?;
+    ctx.reply_to(&notif, "thanks for the follow!").await?;
+    Ok(())
+}
+
+# async fn test() {
+let bot = MockBot::new().await;
+follow_back(bot.context(), bot.follow("alice.test")).await.unwrap();
+
+assert_eq!(bot.created_in("app.bsky.graph.follow").len(), 1); // followed back
+assert_eq!(bot.posts(), vec!["thanks for the follow!"]);      // and thanked
+# }
+```
+
+Fixtures cover every input a handler sees — `mention`, `reply`, `follow`, `like`,
+`repost`, `quote`, `direct_message`, and `stream_post` — and assertions include
+`requests()` (everything, in order), `created()` / `created_in(collection)`, and
+`posts()`. Writes, `updateSeen`, `uploadBlob`, and chat `sendMessage` are all
+mocked; `getRecord` can be primed with `set_profile_record`. The one thing that
+still hits the network is resolving an **`@mention`** inside a post's *text* (the
+SDK resolves handles through Bluesky's public API), so keep asserted text free of
+live mentions.
 
 ## License
 

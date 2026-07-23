@@ -44,6 +44,9 @@
 //!   the window exhausted, so writes pre-empt a 429 instead of absorbing one.
 //! - **Scheduling** — run actions on an interval or a cron schedule (see
 //!   [`Schedule`] and [`BotBuilder::every`]/[`BotBuilder::cron`]).
+//! - **A test harness** ([`testkit`]) — unit-test your handler logic against a
+//!   real [`Context`] served in-process, with no network and no credentials, then
+//!   assert on exactly what the handler did.
 //! - **Graceful shutdown** on `Ctrl-C` or any future you provide.
 //!
 //! ## Quick start
@@ -104,6 +107,7 @@ mod stream;
 mod thread;
 
 pub mod prelude;
+pub mod testkit;
 
 pub use bot::{Bot, BotBuilder};
 pub use config::{BotConfig, DEFAULT_SERVICE};
