@@ -52,6 +52,7 @@ still needs the loop around it. This crate provides:
 | **Media & embeds** | `ctx.compose()` builds posts with images (**alt text required by type**), video, external link cards (auto-fetched OpenGraph), and quote posts — uploaded to your own PDS, so it works on any server. |
 | **Threads & auto-split** | `ctx.thread()` chains posts into a reply thread and splits long text at word boundaries into 300-grapheme posts, with optional `i/N` numbering. |
 | **Direct messages** | `on_message` reacts to private [`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat) conversations; `ctx.send_dm` / `ctx.send_dm_to_convo` reply. The bot's own messages are filtered out, so an echo cannot loop. |
+| **Automated self-label** | `automated_label(true)` declares the account a bot on its profile (the guideline-recommended `bot` self-label), preserving everything else the profile already has. |
 | **Rich text** | Mentions, links, and hashtags are detected and attached as facets automatically. |
 | **Sessions** | `session_file(...)` resumes on restart instead of re-authenticating. |
 | **Rate limiting** | A token bucket modelling Bluesky's points-based write budget (on by default). |
@@ -153,6 +154,7 @@ cargo run --example keyword_stream    # react to network-wide keywords/hashtags 
 cargo run --example media_bot         # reply with images / quotes / link cards
 cargo run --example thread_bot        # reply with an auto-split, numbered thread
 cargo run --example dm_bot            # echo direct messages (chat.bsky.convo)
+cargo run --example self_label_bot    # declare the account automated (bot self-label)
 ```
 
 ## Media & embeds
@@ -342,6 +344,32 @@ looks silent:
 A recipient's inbox setting also gates *sending*: `ctx.send_dm(did, …)` to someone
 who restricts incoming messages fails with a server `MessagesDisabled` error —
 expected, not a bug.
+
+## Self-labeling as automated
+
+Bluesky's [bot guidelines](https://docs.bsky.app/docs/starter-templates/bots)
+recommend that automated accounts add a `bot` self-label to their profile, so
+people and moderation tooling can recognize them. It's a cheap, high-goodwill
+signal — and a hedge against being mistaken for spam. One builder call does it:
+
+```rust
+# use bsky_bot_sdk::prelude::*;
+# fn demo(b: BotBuilder) -> BotBuilder {
+b.automated_label(true)
+    .on_mention(|ctx, notif| async move {
+        ctx.reply_to(&notif, "🤖 beep boop").await?;
+        Ok(())
+    })
+# }
+```
+
+`automated_label(true)` writes the label into the account's
+`app.bsky.actor.profile` record during `build()`, **preserving** the display name,
+description, avatar, and any other self-labels already there — it never clobbers a
+real profile, and it creates one if the account has none yet. The write is
+idempotent and skipped when the profile is already labeled, so it's free on a warm
+restart. For a runtime change, call `ctx.set_automated_label(true | false)`. The
+exact wire value is exposed as `BOT_SELF_LABEL` (`"bot"`).
 
 ## Scheduling
 

@@ -1,6 +1,6 @@
 [package]
 name = "bsky-bot-sdk"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 # 1.88 is the true floor: the transitive `base45` crate (via multibase → cid →
 # ipld-core → atrium-api) uses `<[T]>::as_chunks`, stabilised in Rust 1.88,
@@ -98,3 +98,7 @@ path = "examples/thread_bot.rs"
 [[example]]
 name = "dm_bot"
 path = "examples/dm_bot.rs"
+
+[[example]]
+name = "self_label_bot"
+path = "examples/self_label_bot.rs"

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-23
+
+### Added
+
+- **Automated self-label.** A bot can now declare itself automated by adding the
+  `bot` self-label to its profile, the cheap, guideline-recommended signal that an
+  account is a bot (and a hedge against being mistaken for spam):
+  - `BotBuilder::automated_label(true)` — declarative; the label is written once
+    during `build()`, preserving the display name, description, avatar, and any
+    other self-labels already on the profile. `false` removes it.
+  - `Context::set_automated_label(bool)` — the runtime primitive.
+  - The write is idempotent and skipped entirely when the profile is already in
+    the requested state, so it costs nothing on a warm restart.
+  - `BOT_SELF_LABEL` exposes the exact wire value (`"bot"`).
+  - New `self_label_bot` example.
+
 ## [0.6.1] - 2026-07-23
 
 ### Added

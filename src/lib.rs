@@ -29,6 +29,10 @@
 //!   [`ctx.send_dm`](Context::send_dm) — react to private
 //!   [`chat.bsky.convo`](https://docs.bsky.app/docs/category/chat) conversations
 //!   and reply, the bot's own messages filtered out so an echo cannot loop.
+//! - **Automated self-label** via
+//!   [`automated_label`](BotBuilder::automated_label) — declare the account a bot
+//!   on its profile ([`BOT_SELF_LABEL`]), the guideline-recommended, cheap signal
+//!   that it's automated.
 //! - **Session persistence** so restarts resume instead of re-authenticating.
 //! - **Client-side rate limiting** that respects Bluesky's points-based write
 //!   budget.
@@ -88,6 +92,7 @@ mod event;
 mod handler;
 mod ratelimit;
 mod schedule;
+mod self_label;
 mod stream;
 mod thread;
 
@@ -104,6 +109,7 @@ pub use event::{Notification, NotificationReason, RawNotification};
 pub use handler::BoxFuture;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use schedule::{Schedule, Tz};
+pub use self_label::BOT_SELF_LABEL;
 pub use stream::{
     Backoff, CommitOp, DEFAULT_JETSTREAM_ENDPOINT, JetstreamConfig, RawCommit, RawStreamEvent,
     StreamEvent, StreamKind,

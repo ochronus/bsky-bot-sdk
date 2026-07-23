@@ -80,6 +80,9 @@ pub struct BotBuilder {
     dm_handlers: DmHandlers,
     /// If set, publish the bot's chat inbox policy on startup.
     dm_access: Option<DmAccess>,
+    /// If set, add (`true`) or remove (`false`) the `bot` self-label on the
+    /// profile on startup — declaring the account automated.
+    automated_label: Option<bool>,
     /// The first error from a fallible scheduling call (e.g. a bad cron
     /// expression), surfaced from [`build`](BotBuilder::build) so the builder
     /// chain stays fluent.
@@ -563,6 +566,39 @@ impl BotBuilder {
         self
     }
 
+    // --- self-labeling -----------------------------------------------------
+
+    /// Declare the bot account **automated** by adding the `bot` self-label to its
+    /// profile on startup (or, with `false`, remove it).
+    ///
+    /// Bluesky's [bot guidelines] recommend this: it's a cheap, high-goodwill
+    /// signal that helps people and moderation tooling recognize automated
+    /// accounts, and lowers the chance of being mistaken for spam. The label is
+    /// written into the account's `app.bsky.actor.profile` record during
+    /// [`build`](BotBuilder::build), **preserving** the display name, description,
+    /// avatar, and any other self-labels. Writing is idempotent and skipped when
+    /// the profile is already in the requested state.
+    ///
+    /// For a runtime change use
+    /// [`Context::set_automated_label`](crate::Context::set_automated_label).
+    ///
+    /// ```
+    /// # use bsky_bot_sdk::Bot;
+    /// # fn demo(b: bsky_bot_sdk::BotBuilder) -> bsky_bot_sdk::BotBuilder {
+    /// b.automated_label(true)
+    ///     .on_mention(|ctx, notif| async move {
+    ///         ctx.reply_to(&notif, "🤖 beep boop").await?;
+    ///         Ok(())
+    ///     })
+    /// # }
+    /// ```
+    ///
+    /// [bot guidelines]: https://docs.bsky.app/docs/starter-templates/bots
+    pub fn automated_label(mut self, automated: bool) -> Self {
+        self.automated_label = Some(automated);
+        self
+    }
+
     // --- build -------------------------------------------------------------
 
     /// Authenticate (resuming a saved session if possible, otherwise logging in)
@@ -639,6 +675,14 @@ impl BotBuilder {
         if let Some(access) = self.dm_access {
             context.set_dm_access(access).await?;
             tracing::info!(policy = access.as_wire(), "published chat inbox policy");
+        }
+
+        // 8. Declare the account automated (or clear it) via the profile
+        //    self-label. Idempotent and skipped when already in the requested
+        //    state, so it costs nothing on a warm restart.
+        if let Some(automated) = self.automated_label {
+            context.set_automated_label(automated).await?;
+            tracing::info!(automated, "applied automated self-label");
         }
 
         Ok(Bot {
@@ -1097,5 +1141,23 @@ mod tests {
 
         let builder = Bot::builder().accept_dms_from(DmAccess::Everyone);
         assert_eq!(builder.dm_access, Some(DmAccess::Everyone));
+    }
+
+    #[test]
+    fn automated_label_records_the_flag() {
+        assert_eq!(
+            Bot::builder().automated_label,
+            None,
+            "the profile is left untouched unless the flag is set",
+        );
+        assert_eq!(
+            Bot::builder().automated_label(true).automated_label,
+            Some(true),
+        );
+        assert_eq!(
+            Bot::builder().automated_label(false).automated_label,
+            Some(false),
+            "an explicit false is recorded so the label can be cleared",
+        );
     }
 }

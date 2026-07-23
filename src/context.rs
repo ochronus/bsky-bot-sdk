@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use atrium_api::agent::AtprotoServiceType;
 use atrium_api::agent::bluesky::BSKY_CHAT_DID;
+use atrium_api::app::bsky::actor::profile;
 use atrium_api::app::bsky::feed::{like, post, repost};
 use atrium_api::app::bsky::graph::follow;
 use atrium_api::chat::bsky::actor::declaration;
 use atrium_api::chat::bsky::convo::defs::{MessageInput, MessageInputData};
 use atrium_api::chat::bsky::convo::{get_convo_for_members, get_log, send_message};
-use atrium_api::com::atproto::repo::{create_record, delete_record, strong_ref};
+use atrium_api::com::atproto::repo::{create_record, delete_record, get_record, strong_ref};
 use atrium_api::types::BlobRef;
-use atrium_api::types::string::{Datetime, Did, Handle, RecordKey};
+use atrium_api::types::string::{Datetime, Did, Handle, Nsid, RecordKey};
+use atrium_api::xrpc::error::XrpcErrorKind;
 use bsky_sdk::BskyAgent;
 use bsky_sdk::record::Record;
 use bsky_sdk::rich_text::RichText;
@@ -22,6 +24,7 @@ use crate::embed::PostBuilder;
 use crate::error::{Error, Result};
 use crate::event::Notification;
 use crate::ratelimit::WriteBudget;
+use crate::self_label::{has_bot_label, set_bot_label};
 use crate::thread::ThreadBuilder;
 
 /// The DID of the Bluesky chat service, reached via the `atproto-proxy` header.
@@ -30,6 +33,47 @@ fn chat_service_did() -> Result<Did> {
     BSKY_CHAT_DID
         .parse()
         .map_err(|_| Error::invalid_input(format!("invalid chat service DID: {BSKY_CHAT_DID}")))
+}
+
+/// The literal record key of the singleton profile record.
+fn profile_rkey() -> Result<RecordKey> {
+    "self"
+        .parse()
+        .map_err(|_| Error::invalid_input("invalid record key for profile"))
+}
+
+/// A profile record with no fields set (used when an account has no
+/// `app.bsky.actor.profile` record yet, e.g. a brand-new bot account).
+fn empty_profile() -> profile::RecordData {
+    profile::RecordData {
+        avatar: None,
+        banner: None,
+        created_at: Some(Datetime::now()),
+        description: None,
+        display_name: None,
+        joined_via_starter_pack: None,
+        labels: None,
+        pinned_post: None,
+        pronouns: None,
+        website: None,
+    }
+}
+
+/// Whether an `atrium` XRPC error is a `getRecord` "record not found" — i.e. the
+/// repo simply has no record at that key, as opposed to a transport, auth, or
+/// other server error (which callers must *not* mistake for "no record").
+///
+/// Matches both the lexicon-typed `Custom` form and, for PDSes that return the
+/// error untyped, the `Undefined` form carrying the `RecordNotFound` name.
+fn is_record_not_found(err: &atrium_api::xrpc::Error<get_record::Error>) -> bool {
+    match err {
+        atrium_api::xrpc::Error::XrpcResponse(resp) => match &resp.error {
+            Some(XrpcErrorKind::Custom(get_record::Error::RecordNotFound(_))) => true,
+            Some(XrpcErrorKind::Undefined(body)) => body.error.as_deref() == Some("RecordNotFound"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The bot's own account identity, resolved at login.
@@ -47,6 +91,11 @@ impl BotIdentity {
     /// The bot's DID.
     pub fn did(&self) -> &str {
         self.did.as_str()
+    }
+
+    /// The bot's typed DID, for calls that need an `AtIdentifier`.
+    pub(crate) fn did_typed(&self) -> &Did {
+        &self.did
     }
 
     /// The bot's handle (e.g. `mybot.bsky.social`).
@@ -429,6 +478,83 @@ impl Context {
         Ok(())
     }
 
+    // --- self-labeling -----------------------------------------------------
+
+    /// Declare the bot account **automated** (`automated = true`) or clear that
+    /// declaration (`automated = false`) by adding or removing the `bot`
+    /// self-label on its profile.
+    ///
+    /// Bluesky's bot guidelines recommend automated accounts self-label so people
+    /// and moderation tooling can recognize them; it's a cheap signal that also
+    /// lowers the chance of being mistaken for spam. The label is written into the
+    /// account's `app.bsky.actor.profile` record, **preserving** the display name,
+    /// description, avatar, and every other self-label already there.
+    ///
+    /// The write is idempotent and skipped entirely when the profile is already in
+    /// the requested state, so it is safe to call on every startup. Prefer the
+    /// declarative [`automated_label`](crate::BotBuilder::automated_label) on the
+    /// builder for the common "set it once at boot" case.
+    ///
+    /// ```no_run
+    /// # use bsky_bot_sdk::prelude::*;
+    /// # async fn f(ctx: Context) -> Result<()> {
+    /// ctx.set_automated_label(true).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_automated_label(&self, automated: bool) -> Result<()> {
+        let existing = self.fetch_profile_record().await?;
+        let currently = existing
+            .as_ref()
+            .map(|r| has_bot_label(&r.labels))
+            .unwrap_or(false);
+        // Already in the desired state (including "no profile, and none wanted") —
+        // don't rewrite the record or spend a write against the budget.
+        if currently == automated {
+            return Ok(());
+        }
+
+        let mut record = existing.unwrap_or_else(empty_profile);
+        record.labels = set_bot_label(record.labels, automated);
+
+        self.budget.charge_create().await;
+        record.put(&self.agent, profile_rkey()?).await?;
+        Ok(())
+    }
+
+    /// Fetch the account's own `app.bsky.actor.profile` record, or `None` if it
+    /// has none yet. A missing record is distinguished from other errors so a
+    /// transport/auth failure never masquerades as "no profile" (which would risk
+    /// overwriting a real profile with an empty one).
+    async fn fetch_profile_record(&self) -> Result<Option<profile::RecordData>> {
+        let collection: Nsid = "app.bsky.actor.profile"
+            .parse()
+            .map_err(|_| Error::invalid_input("invalid profile collection NSID"))?;
+        let params = get_record::ParametersData {
+            cid: None,
+            collection,
+            repo: self.identity.did_typed().clone().into(),
+            rkey: profile_rkey()?,
+        };
+        let output = match self
+            .agent
+            .api
+            .com
+            .atproto
+            .repo
+            .get_record(params.into())
+            .await
+        {
+            Ok(output) => output,
+            Err(err) if is_record_not_found(&err) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let value = serde_json::to_value(&output.data.value)?;
+        let record = serde_json::from_value(value)
+            .map_err(|e| Error::InvalidRecord(format!("profile record: {e}")))?;
+        Ok(Some(record))
+    }
+
     /// Fetch one page of the conversation-event log from `cursor`, used by the
     /// direct-message poll loop. Exposed to the crate's DM runner.
     pub(crate) async fn fetch_convo_log(&self, cursor: Option<String>) -> Result<get_log::Output> {
@@ -441,5 +567,55 @@ impl Context {
             .get_log(get_log::ParametersData { cursor }.into())
             .await?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atrium_api::xrpc::error::{ErrorResponseBody, XrpcError};
+    use atrium_api::xrpc::http::StatusCode;
+
+    fn xrpc_400(
+        error: Option<XrpcErrorKind<get_record::Error>>,
+    ) -> atrium_api::xrpc::Error<get_record::Error> {
+        atrium_api::xrpc::Error::XrpcResponse(XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            error,
+        })
+    }
+
+    #[test]
+    fn record_not_found_is_detected_in_the_typed_custom_form() {
+        let err = xrpc_400(Some(XrpcErrorKind::Custom(
+            get_record::Error::RecordNotFound(Some("could not locate record".into())),
+        )));
+        assert!(is_record_not_found(&err));
+    }
+
+    #[test]
+    fn record_not_found_is_detected_in_the_untyped_undefined_form() {
+        // Some PDSes return the error un-typed; the name still identifies it.
+        let err = xrpc_400(Some(XrpcErrorKind::Undefined(ErrorResponseBody {
+            error: Some("RecordNotFound".into()),
+            message: Some("could not locate record".into()),
+        })));
+        assert!(is_record_not_found(&err));
+    }
+
+    #[test]
+    fn other_server_errors_are_not_treated_as_record_not_found() {
+        // The safety-critical case: a transient/auth error must NOT read as
+        // "no record", or the caller would overwrite a real profile with an
+        // empty one.
+        let auth = xrpc_400(Some(XrpcErrorKind::Undefined(ErrorResponseBody {
+            error: Some("AuthenticationRequired".into()),
+            message: None,
+        })));
+        assert!(!is_record_not_found(&auth));
+
+        // A response with no structured error body is likewise not not-found.
+        let bare = xrpc_400(None);
+        assert!(!is_record_not_found(&bare));
     }
 }
