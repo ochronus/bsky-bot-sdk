@@ -6,11 +6,14 @@ name: Release
 # that lives only for the duration of the job, and the action's post step revokes
 # it when the job ends.
 #
-# One-time setup on crates.io (Crate page → Settings → Trusted Publishing → Add):
+# The matching crates.io Trusted Publisher entry is already configured (crate
+# page → Settings → Trusted Publishing) as:
 #   Repository owner:  ochronus
 #   Repository name:   bsky-bot-sdk
 #   Workflow filename: release.yml   <- this file's name; renaming it breaks publishing
 #   Environment:       crates-io     <- must match the `environment:` block below
+# Those four fields *are* the identity crates.io trusts, so changing this file's
+# name or the environment name means updating the entry in the same commit.
 #
 # Release procedure:
 #   1. Bump `version` in Cargo.toml, move the CHANGELOG `[Unreleased]` entries
