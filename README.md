@@ -4,6 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/bsky-bot-sdk.svg)](https://crates.io/crates/bsky-bot-sdk)
 [![docs.rs](https://img.shields.io/docsrs/bsky-bot-sdk)](https://docs.rs/bsky-bot-sdk)
 [![license](https://img.shields.io/crates/l/bsky-bot-sdk.svg)](#license)
+[![msrv](https://img.shields.io/crates/msrv/bsky-bot-sdk)](https://github.com/ochronus/bsky-bot-sdk#installation)
 
 An ergonomic, event-driven SDK for building **Bluesky** (AT Protocol) bots in Rust.
 
@@ -72,7 +73,7 @@ still needs the loop around it. This crate provides:
 
 ```toml
 [dependencies]
-bsky-bot-sdk = "0.5"
+bsky-bot-sdk = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
