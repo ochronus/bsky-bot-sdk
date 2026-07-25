@@ -1,0 +1,110 @@
+name: Release
+
+# Publishes to crates.io via **Trusted Publishing** — no API token is stored in
+# this repository. The `publish` job mints a short-lived GitHub OIDC token,
+# `rust-lang/crates-io-auth-action` exchanges it for a crates.io registry token
+# that lives only for the duration of the job, and the action's post step revokes
+# it when the job ends.
+#
+# One-time setup on crates.io (Crate page → Settings → Trusted Publishing → Add):
+#   Repository owner:  ochronus
+#   Repository name:   bsky-bot-sdk
+#   Workflow filename: release.yml   <- this file's name; renaming it breaks publishing
+#   Environment:       crates-io     <- must match the `environment:` block below
+#
+# Release procedure:
+#   1. Bump `version` in Cargo.toml, move the CHANGELOG `[Unreleased]` entries
+#      under the new version heading, and commit to `main`.
+#   2. git tag -a vX.Y.Z -m "vX.Y.Z"   (this repo requires annotated tags)
+#   3. git push origin main --follow-tags
+#   The tag push triggers this workflow: it verifies the tag matches the manifest
+#   version, runs the test suite, then publishes.
+on:
+  push:
+    # Only version tags publish. A stray tag like `nightly` is ignored.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # Manual re-run for the case where publishing failed *after* the tag was
+  # pushed (a crates.io outage, say). Pick the tag as the ref — the version
+  # check below still gates it, and the environment still restricts it to tags.
+  workflow_dispatch:
+
+# Default for all jobs; the publish job widens this deliberately.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate the publish on the same evidence a push to `main` would produce. Tag
+  # pushes do not trigger ci.yml (it watches branches), so without this a broken
+  # tree could reach crates.io — and a crates.io release is immutable.
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Catches the classic mistake of tagging vX.Y.Z while Cargo.toml still
+      # says the previous version — which would otherwise publish the wrong
+      # version number or fail deep inside the publish step.
+      - name: Tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "bsky-bot-sdk") | .version')"
+          echo "tag=$tag_version manifest=$manifest_version"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version"
+            exit 1
+          fi
+
+      # `--locked` fails rather than silently updating Cargo.lock, so the tree
+      # that gets tested is exactly the tree that gets published.
+      - name: Test
+        run: cargo test --all-features --all-targets --locked
+      - name: Doc tests
+        run: cargo test --all-features --doc --locked
+
+  publish:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    # The environment is the second half of the trusted-publisher identity: the
+    # crates.io configuration names it, so a workflow run that cannot reach this
+    # environment cannot obtain a token. Its deployment rule restricts it to
+    # `v*` tags, and reviewers/wait timers can be added in repo settings.
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/bsky-bot-sdk
+    permissions:
+      contents: read
+      # Lets the job request the OIDC identity token that crates.io verifies.
+      # Without this the auth step fails; this is the only extra privilege
+      # trusted publishing needs.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # `cargo publish` runs its own verification build of the packaged tarball,
+      # so a file missing from the package (rather than from git) still fails here.
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
