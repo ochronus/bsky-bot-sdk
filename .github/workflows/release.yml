@@ -23,10 +23,19 @@ on:
   push:
     # Only version tags publish. A stray tag like `nightly` is ignored.
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
-  # Manual re-run for the case where publishing failed *after* the tag was
-  # pushed (a crates.io outage, say). Pick the tag as the ref — the version
-  # check below still gates it, and the environment still restricts it to tags.
+  # Manual run against an existing tag (the environment only admits `v*` tags,
+  # so `main` is rejected). Two uses:
+  #   - dry run (the default): exercises the whole chain including the crates.io
+  #     token exchange, but stops short of uploading. This is how you confirm the
+  #     Trusted Publishing configuration is right without burning a version.
+  #   - unchecked: re-attempt a publish that failed after the tag was pushed —
+  #     a crates.io outage, say.
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify trusted publishing without uploading the crate"
+        type: boolean
+        default: true
 
 # Default for all jobs; the publish job widens this deliberately.
 permissions:
@@ -104,7 +113,17 @@ jobs:
 
       # `cargo publish` runs its own verification build of the packaged tarball,
       # so a file missing from the package (rather than from git) still fails here.
+      # `inputs.dry_run` is empty on a tag push, so tags always take this branch.
       - name: Publish
+        if: ${{ !inputs.dry_run }}
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      # Reaching this step at all means the OIDC exchange above succeeded, i.e.
+      # the crates.io Trusted Publishing entry matches this repo/workflow/environment.
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Authenticated with crates.io — trusted publishing is configured correctly."
+          cargo publish --dry-run --locked
