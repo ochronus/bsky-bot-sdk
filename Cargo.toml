@@ -59,7 +59,7 @@ futures-util = { version = "0.3", default-features = false, features = [
 # Bluesky video-upload service. reqwest is already in the tree (atrium's default
 # client) and uses native-tls — the same TLS backend as tokio-tungstenite, so no
 # second TLS stack is added. `gzip` lets us read compressed HTML for link cards.
-reqwest = { version = "0.12", features = ["gzip"] }
+reqwest = { version = "0.13", features = ["gzip"] }
 
 # Grapheme-cluster segmentation for the 300-grapheme post limit and thread
 # auto-split. This is the same crate — and the same UAX #29 extended-grapheme
